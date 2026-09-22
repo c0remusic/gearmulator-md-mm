@@ -582,6 +582,54 @@ namespace md
 		m_uc.reset();
 		m_uc.exec();	// prefetch warm-up (retires nothing; matches the synchronous harness)
 
+		// MD_PARALLEL_DSP2 prototype: worker for producer background slices.
+		m_parallelProducer = !isMonomachine() && std::getenv("MD_PARALLEL_DSP2") != nullptr;
+		if(m_parallelProducer)
+			m_producerWorker = std::thread([this] { producerWorkerLoop(); });
+	}
+
+	void Hardware::producerWorkerLoop()
+	{
+		std::unique_lock lock(m_producerMutex);
+		for(;;)
+		{
+			m_producerCv.wait(lock, [this] { return m_producerExit || m_producerTarget != 0; });
+			if(m_producerExit)
+				return;
+			const auto target = m_producerTarget;
+			lock.unlock();
+			auto& dsp = m_dspProducer.dsp();
+			// Advance in one-frame chunks and stop on host-TX backpressure: the
+			// producer must not outrun the UC's 16-word host-input queue. A
+			// backlogged stop simply ends the slice early; the scheduler
+			// re-dispatches once the audio thread has pumped the queue.
+			const auto policy = transportPolicy(m_model);
+			while(dsp.getCycles() < target
+				&& m_dspProducer.hostTxBacklog() <= policy.hostTransmitBackpressureThresholdWords)
+			{
+				const auto chunk = std::min<uint64_t>(target,
+					dsp.getCycles() + g_dsp1CyclesPerEsaiFrame);
+				if(m_schedBoundedJit)
+					dsp.execUntilCycles(chunk);
+				else
+				{
+					while(dsp.getCycles() < chunk)
+						dsp.exec();
+				}
+			}
+			lock.lock();
+			m_producerTarget = 0;
+			m_producerBusy.store(false, std::memory_order_release);
+			m_producerCv.notify_all();
+		}
+	}
+
+	void Hardware::joinProducer()
+	{
+		if(!m_parallelProducer)
+			return;
+		std::unique_lock lock(m_producerMutex);
+		m_producerCv.wait(lock, [this] { return m_producerTarget == 0; });
 	}
 
 	void Hardware::setFrontPanelPublisher(
@@ -603,6 +651,15 @@ namespace md
 
 	Hardware::~Hardware()
 	{
+		if(m_producerWorker.joinable())
+		{
+			{
+				const std::lock_guard lock(m_producerMutex);
+				m_producerExit = true;
+			}
+			m_producerCv.notify_all();
+			m_producerWorker.join();
+		}
 		m_uc.setMidiTransmitTap({});
 	}
 
@@ -1082,6 +1139,12 @@ namespace md
 		if(!m_dspProducer.booted())
 			return;	// pre-boot: DSP2 is not producing; IRQ4 stays deasserted (reset default)
 
+		// Parallel prototype: while the worker owns the producer, defer its pump to a
+		// later step instead of racing its HDI08 state. The MD policy tolerates the
+		// short delay (hostReceiveIrqMinWords batches words, no exact deadlines).
+		if(m_parallelProducer && m_producerBusy.load(std::memory_order_relaxed))
+			return;
+
 		const uint32_t producerMoved = m_dspProducer.pumpHostRx(
 			policy.hostReceiveQueueCapacityWords);
 
@@ -1294,6 +1357,12 @@ namespace md
 		double dsp1Pos = m_schedDspOriginLatched[0] ? schedDspFramePos(0) : target;
 		double dsp2Pos = m_schedDspOriginLatched[1] ? schedDspFramePos(1) : target;
 
+		// MD_PARALLEL_DSP2 prototype: while the worker advances the producer, park it
+		// at the target so the scheduler fills the overlap with UC/DSP1 slices.
+		// advance() joins and mops up whatever the worker slice left unreached.
+		if(m_parallelProducer && m_producerBusy.load(std::memory_order_relaxed))
+			dsp2Pos = target;
+
 		// MM host traffic is a flow-controlled lossless stream. Park a backlogged
 		// DSP slice until the UC drains below
 		// the threshold; a release clamp bounds the stall so a non-draining UC phase cannot
@@ -1363,6 +1432,8 @@ namespace md
 			// transmit registers empty the pump is a no-op (no UC reads happen
 			// mid-skip, so the latched queue state cannot be observed), and the
 			// skip stays transparent.
+			// Parallel prototype: the producer TX flag is read racily while the worker
+			// runs; a stale value delays the skip decision by one probe window only.
 			const bool dspTxClear = !m_dspMixer.hdi08().hasTX()
 				&& !m_dspProducer.hdi08().hasTX();
 			if(((probeCount++ & 15u) == 0) && (isMonomachine() || dspTxClear)
@@ -1440,6 +1511,21 @@ namespace md
 			score.maximumRequestedCycles = std::max(
 				score.maximumRequestedCycles, diagnosticRequested);
 #endif
+			if(m_parallelProducer && idx == 1 && d.booted())
+			{
+				// Producer slice goes to the worker; the scheduler keeps running
+				// UC/DSP1 slices meanwhile (the busy mirror parks DSP2's position).
+				// Slice granularity matches the serial scheduler (one background
+				// quantum): the producer never leads the UC by more than a quantum,
+				// so the HI08 in-flight word count stays bounded as in serial mode.
+				{
+					const std::lock_guard lock(m_producerMutex);
+					m_producerTarget = stopCyc;
+					m_producerBusy.store(true, std::memory_order_release);
+				}
+				m_producerCv.notify_all();
+				return true;
+			}
 			if(m_schedBoundedJit)
 				d.dsp().execUntilCycles(stopCyc);
 			else
@@ -1484,6 +1570,9 @@ namespace md
 
 	void Hardware::schedCatchUpDsp(const uint32_t _dspIndex)
 	{
+		// Parallel prototype: never advance the producer inline while the worker owns it.
+		if((_dspIndex & 1) == 1)
+			joinProducer();
 		// Run the target DSP inline up to the UC's current machine time
 		// (the caller's point in the boot handshake) before a host access. This is what advances the
 		// DSP in fine lockstep with the UC's poll loops, so the UC's ISR/reply polls converge instead
@@ -1544,6 +1633,16 @@ namespace md
 
 	void Hardware::schedCatchUpDspToDsp(const uint32_t _consumer, const uint32_t _producer)
 	{
+		// Parallel prototype: from the worker context, defer the rendezvous entirely -
+		// advancing the consumer from this thread would race the audio thread, and
+		// joining would deadlock. The 2048-deep transport ring absorbs the burst.
+		if(m_parallelProducer)
+		{
+			if(std::this_thread::get_id() == m_producerWorker.get_id())
+				return;
+			if(((_consumer & 1) == 1) || ((_producer & 1) == 1))
+				joinProducer();
+		}
 		// Before a producer DSP enqueues a link frame into the ESSI route,
 		// consumer DSP's input ring, advance the CONSUMER to the producer's current machine time - so a
 		// frame is never consumed "before" (in DSP-time) it was produced, nor an arbitrary quantum
@@ -1619,6 +1718,22 @@ namespace md
 
 		while(schedStep())
 		{
+		}
+
+		// Parallel prototype: the loop can terminate with the worker still finishing
+		// its last producer slice. Join and mop up until the producer reaches the
+		// shared clock too, so every advance() ends in a fully consistent state.
+		if(m_parallelProducer)
+		{
+			for(;;)
+			{
+				joinProducer();
+				if(!schedStep())
+					break;
+				while(schedStep())
+				{
+				}
+			}
 		}
 
 		schedDrainCodecOutput();					// final drain (also covers a UC-only advance window)

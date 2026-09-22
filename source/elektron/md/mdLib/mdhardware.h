@@ -3,9 +3,11 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <condition_variable>
 #include <memory>
 #include <mutex>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include "mddsp.h"
@@ -359,6 +361,20 @@ namespace md
 		std::atomic<uint64_t> m_schedHostAudioOverflow{0};
 		bool     m_schedHostAudioActive = false;	// retain drained frames for a host callback
 		bool     m_schedBoundedJit = true;		// cycle-bounded DSP background slices
+
+		// --- MD_PARALLEL_DSP2 feasibility prototype (Machinedrum only, env-gated).
+		// Runs the producer DSP background slices on a worker thread, overlapped
+		// with the UC and mixer slices of the same advance() call. Joined at every
+		// producer-touching sync point and at the end of each advance().
+		bool m_parallelProducer = false;
+		std::thread m_producerWorker;
+		std::mutex m_producerMutex;
+		std::condition_variable m_producerCv;
+		uint64_t m_producerTarget = 0;			// stop cycle, 0 = worker idle
+		std::atomic<bool> m_producerBusy{false};	// lock-free mirror for scheduler position checks
+		bool m_producerExit = false;
+		void producerWorkerLoop();
+		void joinProducer();
 		std::array<RealtimeHostAudioInputTimeline, 2> m_hostAudioInput;
 		std::array<int64_t, 2> m_hostAudioInputClockOrigin{};
 		std::array<uint64_t, 2> m_hostAudioInputNextRxIndex{};
