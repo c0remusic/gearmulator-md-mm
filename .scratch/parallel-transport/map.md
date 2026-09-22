@@ -48,6 +48,11 @@ aux suites existantes (soaks, timing), zéro régression.
   livraisons datées (D contenu sur DSP2→DSP1 seul, L_lead = quantum),
   6 greffes obligatoires listées ; transport seul plafonne 34-37 % realtime,
   étage 2 fast-forwards requis pour la parité ×4,1 (porté au 07).
+- [Service HI08 sous découplage](issues/05-pump-hi08.md) : pump reste thread
+  audio (take des mots dus, HREQ sur m_rxData seul) ; staging SPSC daté côté
+  DSP (MD profondeur 16, backpressure HTDE naturelle, jamais de park MD) ;
+  lectures de statut exactes via waitForDspTime + publication événementielle ;
+  skip idle borné par prochain readyCycle stagé ; ratifié.
 
 ## Not yet specified
 
