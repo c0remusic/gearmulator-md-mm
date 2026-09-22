@@ -53,6 +53,12 @@ aux suites existantes (soaks, timing), zéro régression.
   DSP (MD profondeur 16, backpressure HTDE naturelle, jamais de park MD) ;
   lectures de statut exactes via waitForDspTime + publication événementielle ;
   skip idle borné par prochain readyCycle stagé ; ratifié.
+- [Validation du modèle contre les contraintes MM](issues/06-strategie-mm.md) :
+  modèle unifié tient, zéro chemin divergent — divergences = constantes
+  TransportPolicy ; seul point non prouvé : round-trip strobe→burst
+  L+D ≈ 2,3 frames (canari mmSine*, fallback D_mm=0 par construction) ;
+  miroirs DCR croisés = seule publication nouvelle ; pas de re-design du 04 ;
+  ratifié.
 
 ## Not yet specified
 
