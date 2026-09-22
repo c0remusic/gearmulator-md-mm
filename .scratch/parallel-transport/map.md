@@ -43,14 +43,19 @@ aux suites existantes (soaks, timing), zéro régression.
 - [Budget de latence interne DSP2→DSP1](issues/03-budget-latence.md) : cible
   1-2 frames codec ; bornes dures : ring < 16 frames (purge MD), dérive
   d'horloge < 32 samples (fenêtre DMA4) ; latence host inchangée ; ratifié.
+- [Modèle de découplage cible](issues/04-modele-decouplage.md) : « Convoi »
+  ratifié (panel 3 designs × 3 juges, unanime) — pipeline 3 threads à
+  livraisons datées (D contenu sur DSP2→DSP1 seul, L_lead = quantum),
+  6 greffes obligatoires listées ; transport seul plafonne 34-37 % realtime,
+  étage 2 fast-forwards requis pour la parité ×4,1 (porté au 07).
 
 ## Not yet specified
 
-- Stratégie de validation/migration incrémentale (feature flag, A/B série vs
-  parallèle, plan de tests au-delà des suites existantes) — dépend du modèle
-  de découplage retenu (04).
-- Accès concurrents hors audio : snapshots UI front panel, state save/restore,
-  `deferredPreparedState` — à instruire une fois le modèle choisi.
+- Forme finale du harnais de validation/migration (périmètre A/B de l'étape 0,
+  flags, plan de tests au-delà des suites) — échelle 0-4 esquissée dans la
+  résolution du 04, à finaliser dans la spec (08).
+- Hook DCR submodule dsp56300 (miroirs DMA1/DMA4) vs polling côté mdLib — à
+  trancher dans la spec (08), impact partage amont.
 - Forme du partage amont (PR, issue, discussion) — après spec.
 
 ## Out of scope
