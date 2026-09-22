@@ -69,6 +69,10 @@ zéro régression.
   barrière à frontière de frame commune (withMachinePaused), quiesce complet
   pour getState/commit setState, machines préparées toujours en série sans
   threads, UI/scorecard en bounded-stale ; requis dès l'étape 2 ; ratifié.
+- [Rédaction de la spec](issues/08-redaction-spec.md) : livrée —
+  `docs/design/parallel-transport-spec.md` (anglais, prêt pour
+  implémentation et partage amont). **Destination atteinte : carte
+  complète, 9/9 tickets résolus.**
 
 ## Not yet specified
 
