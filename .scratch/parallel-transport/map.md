@@ -6,9 +6,11 @@ Label: wayfinder:map
 
 Spec de refonte du transport MD/MM permettant l'exécution parallèle des trois
 processeurs émulés (UC + DSP1 + DSP2), précédée d'un go/no-go étayé.
-Critère de succès : parité de coût CPU thread audio avec l'émulation Virus
-(OsTIrus) mesurée sur la machine de référence (Ryzen 7 3700X), audio conforme
-aux suites existantes (soaks, timing), zéro régression.
+Critère de succès (re-cadré au 07) : cœur le plus chargé mesuré sur la machine
+de référence (Ryzen 7 3700X) — cette carte livre le transport parallèle
+(~34-37 % realtime attendu) ; la parité OsTIrus (23 %) vient d'un étage 2
+séparé post-spec. Audio conforme aux suites existantes (soaks, timing),
+zéro régression.
 
 ## Notes
 
@@ -59,6 +61,10 @@ aux suites existantes (soaks, timing), zéro régression.
   L+D ≈ 2,3 frames (canari mmSine*, fallback D_mm=0 par construction) ;
   miroirs DCR croisés = seule publication nouvelle ; pas de re-design du 04 ;
   ratifié.
+- [Go/no-go étayé](issues/07-go-no-go.md) : **GO** (A/A/A) — métrique
+  re-cadrée en cœur le plus chargé ; refonte Convoi livre ~34-37 % realtime ;
+  étage 2 fast-forwards = effort séparé post-spec pour la parité 23 % ;
+  alternatives écartées (statu quo, CPU, amont-d'abord, engines-only sans UC).
 
 ## Not yet specified
 
@@ -72,8 +78,13 @@ aux suites existantes (soaks, timing), zéro régression.
 ## Out of scope
 
 - Issue amont immédiate avec les mesures (cadrage Q3 : spec d'abord).
+- Étage 2 fast-forwards par composant (trampoline batch 128, maxDoIterations
+  MM 4→64, fast-forward attente-ESSI ; DSP1 −27 %, UC −20 %) — effort séparé
+  charté APRÈS la spec, requis pour la parité ×4,1 (décision du 07).
 - Micro-optimisations JIT restantes (fast-forward poll GPIO `0xbb-0xbf`,
   spécialisation DO-memset) — effort séparé si repris.
+- « Engines-only » sans UC/séquenceur (analogie Overbridge) — écarté au 07 :
+  plafond DSP1 inchangé, rétro-ingénierie protocole HI08, risque fidélité.
 - Boot-warmup (pics de lancement ×200 budget) — indépendant du transport,
   effort séparé déjà identifié en session.
 - Correction des 5 échecs ctest préexistants de la branche alpha.
