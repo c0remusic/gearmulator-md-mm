@@ -65,6 +65,10 @@ zéro régression.
   re-cadrée en cœur le plus chargé ; refonte Convoi livre ~34-37 % realtime ;
   étage 2 fast-forwards = effort séparé post-spec pour la parité 23 % ;
   alternatives écartées (statu quo, CPU, amont-d'abord, engines-only sans UC).
+- [Quiesce et accès concurrents hors audio](issues/09-quiesce-acces-concurrents.md) :
+  barrière à frontière de frame commune (withMachinePaused), quiesce complet
+  pour getState/commit setState, machines préparées toujours en série sans
+  threads, UI/scorecard en bounded-stale ; requis dès l'étape 2 ; ratifié.
 
 ## Not yet specified
 
