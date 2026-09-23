@@ -290,6 +290,11 @@ if(BUILD_TESTING)
 	add_md_automation_firmware_test(mdParallelTransportFirmwareTest
 		mdParallelTransportFirmwareTest.cpp)
 	add_test(NAME mdParallelTransportFirmwareTest COMMAND mdParallelTransportFirmwareTest)
+
+	# Host-like performance bench for the threaded transport (not a ctest:
+	# wall-clock results depend on the machine and its load).
+	add_md_automation_firmware_test(mdParallelTransportBenchmark
+		mdParallelTransportBenchmark.cpp)
 	set_tests_properties(mdParallelTransportFirmwareTest PROPERTIES
 		LABELS "Integration;FirmwareTest;Transport" SKIP_RETURN_CODE 77 TIMEOUT 600)
 
