@@ -56,6 +56,18 @@ namespace mdJucePlugin
 		}
 		bool isRamRecordingModeAvailable();
 
+		// Parallel transport setting (Machinedrum only; on by default). The
+		// config value is the source of truth; apply pushes it to the device.
+		static constexpr const char* ParallelTransportConfigKey = "parallelTransport";
+		bool supportsParallelTransport() const { return m_model == md::MachineModel::Machinedrum; }
+		bool getParallelTransportSetting();
+		void applyParallelTransportSetting();
+		// The device follows the setting now, or will after a reload.
+		bool isParallelTransportActive();
+		// Default plug-in latency for a new configuration: two blocks let the
+		// Machinedrum render ahead on its own threads (see md::AsyncRender).
+		static constexpr int DefaultLatencyBlocks = 2;
+
 	    jucePluginEditorLib::PluginEditorState* createEditorState() override;
 	    synthLib::Device* createDevice() override;
 		void getRemoteDeviceParams(synthLib::DeviceCreateParams& _params) const override;

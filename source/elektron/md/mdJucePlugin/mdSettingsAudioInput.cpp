@@ -1,6 +1,9 @@
 #include "mdSettingsAudioInput.h"
 
+#include "mdPluginProcessor.h"
+
 #include "jucePluginEditorLib/pluginProcessor.h"
+#include "jucePluginEditorLib/settingsPlugin.h"
 #include "juceRmlUi/rmlEventListener.h"
 #include "juceRmlUi/rmlHelper.h"
 
@@ -25,12 +28,25 @@ namespace mdJucePlugin
 		: m_processor(_processor)
 		, m_status(juceRmlUi::helper::findChild(_root, "audioInputStatus"))
 		, m_settings(juceRmlUi::helper::findChild(_root, "btAudioInputSettings"))
+		, m_transportStatus(juceRmlUi::helper::findChild(_root, "parallelTransportStatus", false))
 	{
 		juceRmlUi::EventListener::AddClick(m_settings, [this]
 		{
 			if(auto* const holder = standaloneHolder(m_processor))
 				holder->showAudioSettingsDialog();
 		});
+		// The Machinedrum page carries the transport switch; the toggle writes
+		// the config value, the processor pushes it to the device.
+		auto& processor = static_cast<AudioPluginAudioProcessor&>(m_processor);
+		if(processor.supportsParallelTransport())
+		{
+			jucePluginEditorLib::SettingsPlugin::createToggleButton(_root, "btParallelTransport",
+				m_processor.getConfig(), AudioPluginAudioProcessor::ParallelTransportConfigKey, [this](bool)
+				{
+					static_cast<AudioPluginAudioProcessor&>(m_processor).applyParallelTransportSetting();
+					updateTransportStatus();
+				}, true);
+		}
 		timerCallback();
 		startTimerHz(2);
 	}
@@ -63,6 +79,32 @@ namespace mdJucePlugin
 			m_settings->SetProperty(Rml::PropertyId::Display,
 				holder ? Rml::Style::Display::Block : Rml::Style::Display::None);
 			m_lastStatus = std::move(status);
+		}
+		updateTransportStatus();
+	}
+
+	void SettingsAudioInput::updateTransportStatus()
+	{
+		if(!m_transportStatus)
+			return;
+		auto& processor = static_cast<AudioPluginAudioProcessor&>(m_processor);
+		const bool wanted = processor.getParallelTransportSetting();
+		const bool active = processor.isParallelTransportActive();
+		const bool latency = processor.getPlugin().getLatencyBlocks() > 0;
+		std::string status;
+		if(wanted && active)
+			status = latency ? "Parallel transport is running."
+				: "Parallel transport is running. Set the latency to 1 or 2 blocks to move the emulation off the host's audio thread.";
+		else if(wanted)
+			status = "Parallel transport starts once the machine has finished booting.";
+		else if(active)
+			status = "Parallel transport stays on until the plug-in is reloaded.";
+		else
+			status = "The whole machine runs on one CPU core.";
+		if(status != m_lastTransportStatus)
+		{
+			m_transportStatus->SetInnerRML(Rml::StringUtilities::EncodeRml(status));
+			m_lastTransportStatus = std::move(status);
 		}
 	}
 }

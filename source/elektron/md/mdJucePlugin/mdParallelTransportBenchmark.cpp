@@ -7,7 +7,7 @@
 // the wall time per second of audio and the per-block distribution, so thread
 // priority, placement and wait policies can be compared offline.
 //
-// Usage: mdParallelTransportBenchmark [--mode serial|parallel] [--warmup S]
+// Usage: mdParallelTransportBenchmark [--mode serial|parallel|default] [--warmup S]
 //        [--seconds S] [--callers N] [--load N] [--prio normal|high|mmcss]
 //        [--profile N] [--paced 0|1] [--latency-blocks N]
 // MDMM_WORKER_PRIORITY=normal|high overrides the worker's MMCSS registration.
@@ -402,7 +402,9 @@ int main(const int _argc, char** _argv)
 		juce::ScopedJuceInitialiser_GUI gui;
 		synthLib::RomLoader::addSearchPath(
 			juce::File(romPath).getParentDirectory().getFullPathName().toStdString());
-		setTransportMode(options.mode);
+		// "default" leaves MDMM_TRANSPORT unset: the plug-in's own setting applies.
+		if(options.mode != "default")
+			setTransportMode(options.mode);
 
 		Harness harness(md::MachineModel::Machinedrum);
 		if(!harness.hasLocalFirmware())
@@ -446,9 +448,10 @@ int main(const int _argc, char** _argv)
 		harness.processor.getPlugin().withDeviceLocked([&](synthLib::Device* const _device)
 		{
 			if(const auto* const device = dynamic_cast<md::Device*>(_device))
-				std::printf("mdParallelTransportBenchmark: device extraLatency=%u async=%d factoryCacheReady=%d "
-					"factoryInitExpected=%d restorePending=%d\n",
+				std::printf("mdParallelTransportBenchmark: device extraLatency=%u async=%d parallel requested=%d active=%d "
+					"factoryCacheReady=%d factoryInitExpected=%d restorePending=%d\n",
 					device->getExtraLatencySamples(), device->isRenderingAsync() ? 1 : 0,
+					device->isParallelTransportRequested() ? 1 : 0, device->isParallelTransportActive() ? 1 : 0,
 					device->getHardware().isFactoryFlashCacheReady() ? 1 : 0,
 					device->getHardware().isFactoryFlashInitializationExpected() ? 1 : 0,
 					device->isProjectStateRestorePending() ? 1 : 0);

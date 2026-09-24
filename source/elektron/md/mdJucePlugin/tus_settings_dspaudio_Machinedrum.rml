@@ -9,5 +9,16 @@
 	<settingsspacer1/>
 	<button id="btAudioInputSettings" class="button">Open Audio/MIDI Settings...</button>
 	<settingsspacer1/>
+	<h1>CPU Load</h1>
+	<settingsspacer1/>
+	<div id="btParallelTransport" class="settings-checkboxwithlabel">
+		<button id="button" class="settings-checkbox"/>
+		<label>Parallel transport (recommended)</label>
+	</div>
+	<settingsspacer1/>
+	<label>Runs the voice DSP on its own CPU core. Together with a latency of 1 or 2 blocks, the emulation then runs outside the host's audio thread, which keeps the DAW's CPU meter low.</label>
+	<settingsspacer1/>
+	<label id="parallelTransportStatus"/>
+	<settingsspacer1/>
 </body>
 </template>
