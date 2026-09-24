@@ -9,23 +9,33 @@
 //
 // Usage: mdParallelTransportBenchmark [--mode serial|parallel] [--warmup S]
 //        [--seconds S] [--callers N] [--load N] [--prio normal|high|mmcss]
+//        [--profile N]
 // MDMM_WORKER_PRIORITY=normal|high overrides the worker's MMCSS registration.
+// --profile N samples both DSPs' program counters during the measured window
+// and prints the N hottest addresses with the code there, to see where the
+// emulated cycles go (signal processing, or firmware waiting on a peripheral).
 // Needs GEARMULATOR_MD_FIRMWARE_BIN, like the firmware tests.
 
 #include "mdAutomationTestSupport.h"
 #include "synthLib/romLoader.h"
 #include "dsp56kBase/threadtools.h"
+#include "dsp56kEmu/disasm.h"
+#include "dsp56kEmu/dsp.h"
+#include "dsp56kEmu/memory.h"
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <memory>
 #include <mutex>
 #include <string>
 #include <thread>
+#include <unordered_map>
 #include <vector>
 
 namespace
@@ -44,6 +54,80 @@ namespace
 		// (time-critical) or "mmcss" (the MMCSS "Pro Audio" task that host
 		// engine threads such as Ableton Live's AudioCalc threads join).
 		std::string priority = "normal";
+		int profile = 0;		// hottest DSP addresses to print, 0 = no profile
+	};
+
+	// Samples the program counters of the two DSPs from its own thread. The
+	// reads race with the emulation on purpose (a diagnostic, not a product
+	// path): a JIT DSP updates its PC at block boundaries, so each sample names
+	// the block it is running or about to run, which is enough to find the
+	// loops that consume the cycles.
+	class PcProfiler
+	{
+	public:
+		PcProfiler(std::array<dsp56k::DSP*, 2> _dsps) : m_dsps(_dsps)
+		{
+			m_thread = std::thread([this]
+			{
+				auto next = Clock::now();
+				while(!m_exit.load(std::memory_order_relaxed))
+				{
+					for(size_t i = 0; i < m_dsps.size(); ++i)
+						++m_histogram[i][m_dsps[i]->getPC().toWord()];
+					++m_samples;
+					next += std::chrono::microseconds(20);
+					while(Clock::now() < next)
+						std::this_thread::yield();
+				}
+			});
+		}
+
+		~PcProfiler() { stop(); }
+
+		void stop()
+		{
+			m_exit.store(true);
+			if(m_thread.joinable())
+				m_thread.join();
+		}
+
+		void print(const int _top)
+		{
+			static const char* const names[] = {"DSP1 mixer", "DSP2 producer"};
+			for(size_t i = 0; i < m_dsps.size(); ++i)
+			{
+				std::vector<std::pair<uint32_t, uint64_t>> hot(m_histogram[i].begin(), m_histogram[i].end());
+				std::sort(hot.begin(), hot.end(), [](const auto& _a, const auto& _b) { return _a.second > _b.second; });
+				std::printf("mdParallelTransportBenchmark: profile %s, %llu samples, %zu distinct addresses\n",
+					names[i], static_cast<unsigned long long>(m_samples), hot.size());
+				auto& dsp = *m_dsps[i];
+				for(int n = 0; n < _top && n < static_cast<int>(hot.size()); ++n)
+				{
+					const uint32_t pc = hot[static_cast<size_t>(n)].first;
+					std::printf("  %5.1f%%  p:$%06x", 100.0 * static_cast<double>(hot[static_cast<size_t>(n)].second)
+						/ static_cast<double>(m_samples), pc);
+					// The first few instructions of the block.
+					uint32_t addr = pc;
+					for(int k = 0; k < 4; ++k)
+					{
+						const auto op = dsp.memory().get(dsp56k::MemArea_P, addr);
+						const auto opB = dsp.memory().get(dsp56k::MemArea_P, addr + 1);
+						std::string text;
+						const auto len = dsp.disassembler().disassemble(text, op, opB, 0, 0, addr);
+						std::printf("%s %s", k ? " |" : "  ", text.c_str());
+						addr += std::max(1u, len);
+					}
+					std::printf("\n");
+				}
+			}
+		}
+
+	private:
+		std::array<dsp56k::DSP*, 2> m_dsps;
+		std::array<std::unordered_map<uint32_t, uint64_t>, 2> m_histogram;
+		uint64_t m_samples = 0;
+		std::atomic<bool> m_exit{false};
+		std::thread m_thread;
 	};
 
 	// Applies an Options::priority to the calling thread; returns the MMCSS
@@ -76,6 +160,8 @@ namespace
 				options.load = std::max(0, std::stoi(value));
 			else if(key == "--prio")
 				options.priority = value;
+			else if(key == "--profile")
+				options.profile = std::max(0, std::stoi(value));
 			else
 				throw std::runtime_error("unknown option " + key);
 		}
@@ -244,6 +330,17 @@ int main(const int _argc, char** _argv)
 		pool.process(options.warmupSeconds * blocksPerSecond);
 
 		const auto blocks = options.seconds * blocksPerSecond;
+		std::unique_ptr<PcProfiler> profiler;
+		if(options.profile > 0)
+		{
+			harness.processor.getPlugin().withDeviceLocked([&](synthLib::Device* const _device)
+			{
+				if(auto* const device = dynamic_cast<md::Device*>(_device))
+					profiler = std::make_unique<PcProfiler>(std::array<dsp56k::DSP*, 2>{
+						&device->getHardware().getDspMixer().dsp(),
+						&device->getHardware().getDspProducer().dsp()});
+			});
+		}
 		std::vector<int64_t> durations;
 		double wall = 0.0;
 		{
@@ -251,6 +348,11 @@ int main(const int _argc, char** _argv)
 			const auto start = Clock::now();
 			durations = pool.process(blocks);
 			wall = std::chrono::duration<double>(Clock::now() - start).count();
+		}
+		if(profiler)
+		{
+			profiler->stop();
+			profiler->print(options.profile);
 		}
 
 		const int64_t deadlineNs = static_cast<int64_t>(1e9 * BlockSize / 48000.0);
