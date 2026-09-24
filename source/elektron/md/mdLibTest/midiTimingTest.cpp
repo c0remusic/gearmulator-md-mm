@@ -334,6 +334,9 @@ namespace
 			params.customData = md::deviceCustomData(model);
 			auto device = std::make_unique<md::Device>(params);
 			require(device->isValid(), "invalid device");
+			// These checks read the machine directly after each call: they test
+			// the synchronous device, which applies the latency as a MIDI delay.
+			device->setAsyncRenderAllowed(false);
 			synthLib::Plugin plugin(device.get(), [](synthLib::Device*) {});
 			plugin.setHostSamplerate(44100, 44100);
 			plugin.setBlockSize(512);

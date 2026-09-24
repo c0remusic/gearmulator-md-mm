@@ -9,8 +9,14 @@
 //
 // Usage: mdParallelTransportBenchmark [--mode serial|parallel] [--warmup S]
 //        [--seconds S] [--callers N] [--load N] [--prio normal|high|mmcss]
-//        [--profile N]
+//        [--profile N] [--paced 0|1] [--latency-blocks N]
 // MDMM_WORKER_PRIORITY=normal|high overrides the worker's MMCSS registration.
+// --paced 1 runs the blocks at real-time pace like an audio device (a late
+// block is an xrun, the next one starts at the following period) with the
+// host flagged realtime, and reports what a DAW CPU meter shows: the time
+// inside the plug-in's process call as a share of the period.
+// --latency-blocks N sets the plug-in latency; any latency renders the
+// machine on its own thread (md::AsyncRender).
 // --profile N samples both DSPs' program counters during the measured window
 // and prints the N hottest addresses with the code there, to see where the
 // emulated cycles go (signal processing, or firmware waiting on a peripheral).
@@ -55,6 +61,8 @@ namespace
 		// engine threads such as Ableton Live's AudioCalc threads join).
 		std::string priority = "normal";
 		int profile = 0;		// hottest DSP addresses to print, 0 = no profile
+		bool paced = false;		// real-time pacing: report the DAW-meter view
+		int latencyBlocks = -1;	// plug-in latency in blocks, -1 = the device default
 	};
 
 	// Samples the program counters of the two DSPs from its own thread. The
@@ -65,7 +73,7 @@ namespace
 	class PcProfiler
 	{
 	public:
-		PcProfiler(std::array<dsp56k::DSP*, 2> _dsps) : m_dsps(_dsps)
+		PcProfiler(std::array<dsp56k::DSP*, 2> _dsps, mc68k::Mc68k* _uc) : m_dsps(_dsps), m_uc(_uc)
 		{
 			m_thread = std::thread([this]
 			{
@@ -74,6 +82,8 @@ namespace
 				{
 					for(size_t i = 0; i < m_dsps.size(); ++i)
 						++m_histogram[i][m_dsps[i]->getPC().toWord()];
+					if(m_uc)
+						++m_ucHistogram[m_uc->getPC()];
 					++m_samples;
 					next += std::chrono::microseconds(20);
 					while(Clock::now() < next)
@@ -120,10 +130,43 @@ namespace
 					std::printf("\n");
 				}
 			}
+			if(!m_uc)
+				return;
+			std::vector<std::pair<uint32_t, uint64_t>> hot(m_ucHistogram.begin(), m_ucHistogram.end());
+			std::sort(hot.begin(), hot.end(), [](const auto& _a, const auto& _b) { return _a.second > _b.second; });
+			std::printf("mdParallelTransportBenchmark: profile UC, %llu samples, %zu distinct addresses\n",
+				static_cast<unsigned long long>(m_samples), hot.size());
+			for(int n = 0; n < _top && n < static_cast<int>(hot.size()); ++n)
+			{
+				const uint32_t pc = hot[static_cast<size_t>(n)].first;
+				// Raw opcode words (Musashi's disassembler reads through a global
+				// instance that is not necessarily this machine).
+				std::printf("  %5.1f%%  $%06x ", 100.0 * static_cast<double>(hot[static_cast<size_t>(n)].second)
+					/ static_cast<double>(m_samples), pc);
+				for(uint32_t w = 0; w < 4; ++w)
+					std::printf(" %04x", m_uc->read16(pc + w * 2));
+				std::printf("\n");
+			}
+			if(const char* const dump = std::getenv("MDMM_BENCH_UCDUMP"))
+			{
+				// MDMM_BENCH_UCDUMP=start:end dumps a code range as words.
+				const auto begin = static_cast<uint32_t>(std::strtoul(dump, nullptr, 16));
+				const char* const colon = std::strchr(dump, ':');
+				const auto end = colon ? static_cast<uint32_t>(std::strtoul(colon + 1, nullptr, 16)) : begin + 0x40;
+				for(uint32_t a = begin & ~1u; a < end; a += 16)
+				{
+					std::printf("  ucdump $%06x:", a);
+					for(uint32_t w = 0; w < 8; ++w)
+						std::printf(" %04x", m_uc->read16(a + w * 2));
+					std::printf("\n");
+				}
+			}
 		}
 
 	private:
 		std::array<dsp56k::DSP*, 2> m_dsps;
+		mc68k::Mc68k* m_uc = nullptr;
+		std::unordered_map<uint32_t, uint64_t> m_ucHistogram;
 		std::array<std::unordered_map<uint32_t, uint64_t>, 2> m_histogram;
 		uint64_t m_samples = 0;
 		std::atomic<bool> m_exit{false};
@@ -162,6 +205,10 @@ namespace
 				options.priority = value;
 			else if(key == "--profile")
 				options.profile = std::max(0, std::stoi(value));
+			else if(key == "--paced")
+				options.paced = std::stoi(value) != 0;
+			else if(key == "--latency-blocks")
+				options.latencyBlocks = std::stoi(value);
 			else
 				throw std::runtime_error("unknown option " + key);
 		}
@@ -205,7 +252,12 @@ namespace
 		}
 
 		// Processes _blocks blocks and returns each block's wall time in ns.
-		std::vector<int64_t> process(const int _blocks)
+		// A non-zero _period paces the blocks like an audio device: a block
+		// starts at the next period boundary, and one that returns after its
+		// period ended is an xrun - the device does not wait, so the next block
+		// starts at the following boundary instead of catching up back to back.
+		std::vector<int64_t> process(const int _blocks,
+			const std::chrono::nanoseconds _period = std::chrono::nanoseconds(0))
 		{
 			std::vector<int64_t> durations(static_cast<size_t>(_blocks));
 			{
@@ -213,6 +265,10 @@ namespace
 				m_durations = &durations;
 				m_remaining = _blocks;
 				m_index = 0;
+				m_period = _period;
+				m_xruns = 0;
+				m_start = Clock::now() + std::chrono::milliseconds(5);
+				m_nextDeadline = m_start;
 				m_cv.notify_all();
 				m_cv.wait(lock, [this] { return m_remaining == 0; });
 				m_durations = nullptr;
@@ -233,11 +289,33 @@ namespace
 				});
 				if(m_exit)
 					return;
+				const auto deadline = m_nextDeadline;
+				const bool paced = m_period.count() > 0;
 				lock.unlock();
+				if(paced)
+				{
+					// Yield up to the block's start time: a sleep can overshoot
+					// by a whole OS timer tick and fake an xrun.
+					while(Clock::now() < deadline)
+						std::this_thread::yield();
+				}
 				const auto start = Clock::now();
 				m_harness.process(1);
-				const auto ns = std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now() - start).count();
+				const auto end = Clock::now();
+				const auto ns = std::chrono::duration_cast<std::chrono::nanoseconds>(end - start).count();
 				lock.lock();
+				if(paced)
+				{
+					m_nextDeadline = deadline + m_period;
+					if(end > m_nextDeadline)
+					{
+						// Missed the device's next period: an xrun. Resume at
+						// the first boundary still ahead.
+						++m_xruns;
+						while(m_nextDeadline < end)
+							m_nextDeadline += m_period;
+					}
+				}
 				(*m_durations)[static_cast<size_t>(m_index++)] = ns;
 				++m_turn;
 				--m_remaining;
@@ -255,6 +333,12 @@ namespace
 		int m_remaining = 0;
 		int m_index = 0;
 		std::vector<int64_t>* m_durations = nullptr;
+		std::chrono::nanoseconds m_period{0};
+		Clock::time_point m_start;
+		Clock::time_point m_nextDeadline;
+		int m_xruns = 0;
+	public:
+		int xruns() const { return m_xruns; }
 	};
 
 	// Busy threads standing in for the host's other tracks.
@@ -323,7 +407,14 @@ int main(const int _argc, char** _argv)
 		Harness harness(md::MachineModel::Machinedrum);
 		if(!harness.hasLocalFirmware())
 			return SkipReturnCode;
+		if(options.latencyBlocks >= 0)
+			harness.processor.setLatencyBlocks(static_cast<uint32_t>(options.latencyBlocks));
 		harness.prepare();
+		// A paced run stands for a DAW in playback: a realtime host, whose
+		// controller work runs on the message thread and not in the audio
+		// callback (the harness defaults to non-realtime for the tests).
+		if(options.paced)
+			harness.audioProcessor.setNonRealtime(false);
 
 		const int blocksPerSecond = 48000 / BlockSize;
 		CallerPool pool(options.callers, harness, options.priority);
@@ -338,16 +429,144 @@ int main(const int _argc, char** _argv)
 				if(auto* const device = dynamic_cast<md::Device*>(_device))
 					profiler = std::make_unique<PcProfiler>(std::array<dsp56k::DSP*, 2>{
 						&device->getHardware().getDspMixer().dsp(),
-						&device->getHardware().getDspProducer().dsp()});
+						&device->getHardware().getDspProducer().dsp()}, &device->getHardware().getUC());
 			});
 		}
+		const auto asyncStats = [&]
+		{
+			md::AsyncRender::Stats stats{};
+			harness.processor.getPlugin().withDeviceLocked([&](synthLib::Device* const _device)
+			{
+				if(const auto* const device = dynamic_cast<md::Device*>(_device))
+					stats = device->asyncStats();
+			});
+			return stats;
+		};
+		const auto asyncBefore = asyncStats();
+		harness.processor.getPlugin().withDeviceLocked([&](synthLib::Device* const _device)
+		{
+			if(const auto* const device = dynamic_cast<md::Device*>(_device))
+				std::printf("mdParallelTransportBenchmark: device extraLatency=%u async=%d factoryCacheReady=%d "
+					"factoryInitExpected=%d restorePending=%d\n",
+					device->getExtraLatencySamples(), device->isRenderingAsync() ? 1 : 0,
+					device->getHardware().isFactoryFlashCacheReady() ? 1 : 0,
+					device->getHardware().isFactoryFlashInitializationExpected() ? 1 : 0,
+					device->isProjectStateRestorePending() ? 1 : 0);
+		});
 		std::vector<int64_t> durations;
 		double wall = 0.0;
 		{
 			Load load(options.load, options.priority);
 			const auto start = Clock::now();
-			durations = pool.process(blocks);
+			durations = pool.process(blocks, options.paced
+				? std::chrono::nanoseconds(static_cast<int64_t>(1e9 * BlockSize / 48000.0))
+				: std::chrono::nanoseconds(0));
 			wall = std::chrono::duration<double>(Clock::now() - start).count();
+		}
+		{
+			const auto asyncAfter = asyncStats();
+			const auto jobs = asyncAfter.jobs - asyncBefore.jobs;
+			if(jobs)
+			{
+				const double period = 1e9 * BlockSize / 48000.0;
+				std::printf("mdParallelTransportBenchmark: async jobs=%llu render mean=%.1f%% of period, "
+					"host wait mean=%.1f%% of period, max job frames=%llu backlog mean=%.2f max=%llu render idle=%.1f%% of wall "
+					"queue=%.1fus/job\n",
+					static_cast<unsigned long long>(jobs),
+					100.0 * static_cast<double>(asyncAfter.renderNs - asyncBefore.renderNs) / static_cast<double>(jobs) / period,
+					100.0 * static_cast<double>(asyncAfter.waitNs - asyncBefore.waitNs) / static_cast<double>(blocks) / period,
+					static_cast<unsigned long long>(asyncAfter.maxJobFrames),
+					static_cast<double>(asyncAfter.backlogSum - asyncBefore.backlogSum) / static_cast<double>(blocks),
+					static_cast<unsigned long long>(asyncAfter.backlogMax),
+					100.0 * static_cast<double>(asyncAfter.idleNs - asyncBefore.idleNs) / (wall * 1e9),
+					static_cast<double>(asyncAfter.queueNs - asyncBefore.queueNs) / static_cast<double>(jobs) / 1000.0);
+				// Distribution of the render time per job over the measured window.
+				std::vector<int64_t> times;
+				harness.processor.getPlugin().withDeviceLocked([&](synthLib::Device* const _device)
+				{
+					const auto* const device = dynamic_cast<md::Device*>(_device);
+					if(!device || !device->asyncRender())
+						return;
+					const auto& ring = device->asyncRender()->jobTimesNs();
+					const auto count = std::min<uint64_t>(jobs, md::AsyncRender::JobTimeCount);
+					for(uint64_t j = asyncAfter.jobs - count; j < asyncAfter.jobs; ++j)
+						times.push_back(ring[j % md::AsyncRender::JobTimeCount]);
+				});
+				if(std::getenv("MDMM_BENCH_TIMELINE"))
+				{
+					// Timeline around the first two blocks that took more than a period.
+					harness.processor.getPlugin().withDeviceLocked([&](synthLib::Device* const _device)
+					{
+						const auto* const device = dynamic_cast<md::Device*>(_device);
+						if(!device || !device->asyncRender())
+							return;
+						const auto& tl = device->asyncRender()->timeline();
+						int shown = 0;
+						for(size_t b = 8; b < durations.size() && shown < 2; ++b)
+						{
+							if(static_cast<double>(durations[b]) <= period)
+								continue;
+							++shown;
+							const uint64_t center = asyncBefore.jobs + b;
+							const int64_t origin = tl[(center - 8) % md::AsyncRender::JobTimeCount].hostEntry;
+							for(uint64_t j = center - 8; j <= center + 3; ++j)
+							{
+								const auto& t = tl[j % md::AsyncRender::JobTimeCount];
+								std::printf("mdParallelTransportBenchmark: tl block %+lld host %8.1f..%8.1f  render %8.1f..%8.1f us\n",
+									static_cast<long long>(j) - static_cast<long long>(center),
+									static_cast<double>(t.hostEntry - origin) / 1000.0, static_cast<double>(t.hostResume - origin) / 1000.0,
+									static_cast<double>(t.renderStart - origin) / 1000.0, static_cast<double>(t.renderEnd - origin) / 1000.0);
+							}
+						}
+					});
+				}
+				if(!times.empty() && std::getenv("MDMM_BENCH_JOBSERIES"))
+				{
+					// Consecutive render times in % of the period, for spotting bursts.
+					std::printf("mdParallelTransportBenchmark: series");
+					for(size_t j = 0; j < std::min<size_t>(times.size(), 400); ++j)
+						std::printf(" %d", static_cast<int>(100.0 * static_cast<double>(times[j]) / period));
+					std::printf("\n");
+				}
+				if(!times.empty())
+				{
+					const auto over = std::count_if(times.begin(), times.end(),
+						[&](const int64_t _ns) { return static_cast<double>(_ns) > period; });
+					std::printf("mdParallelTransportBenchmark: render p10=%.1f%% p50=%.1f%% p90=%.1f%% p99=%.1f%% max=%.1f%% "
+						"jobs>period=%lld/%zu\n",
+						100.0 * static_cast<double>(percentile(times, 0.1)) / period,
+						100.0 * static_cast<double>(percentile(times, 0.5)) / period,
+						100.0 * static_cast<double>(percentile(times, 0.9)) / period,
+						100.0 * static_cast<double>(percentile(times, 0.99)) / period,
+						100.0 * static_cast<double>(*std::max_element(times.begin(), times.end())) / period,
+						static_cast<long long>(over), times.size());
+				}
+			}
+		}
+		if(options.paced)
+		{
+			// What a DAW CPU meter shows: time inside the plug-in's process
+			// call as a share of the buffer period.
+			const double period = 1e9 * BlockSize / 48000.0;
+			double sum = 0.0;
+			for(const auto d : durations)
+				sum += static_cast<double>(d);
+			const auto over30 = std::count_if(durations.begin(), durations.end(),
+				[&](const int64_t _ns) { return static_cast<double>(_ns) > 0.3 * period; });
+			// Where the worst blocks are (a window-start artifact shows as index 0-2).
+			std::printf("mdParallelTransportBenchmark: blocks over one period at");
+			for(size_t b = 0; b < durations.size(); ++b)
+				if(static_cast<double>(durations[b]) > period)
+					std::printf(" %zu(%.0f%%)", b, 100.0 * static_cast<double>(durations[b]) / period);
+			std::printf("\n");
+			std::printf("mdParallelTransportBenchmark: meter mean=%.1f%% p50=%.1f%% p99=%.1f%% max=%.1f%% "
+				"blocks>30%%=%lld/%zu xruns=%d latencyBlocks=%u\n",
+				100.0 * sum / static_cast<double>(durations.size()) / period,
+				100.0 * static_cast<double>(percentile(durations, 0.5)) / period,
+				100.0 * static_cast<double>(percentile(durations, 0.99)) / period,
+				100.0 * static_cast<double>(*std::max_element(durations.begin(), durations.end())) / period,
+				static_cast<long long>(over30), durations.size(), pool.xruns(),
+				harness.processor.getPlugin().getLatencyBlocks());
 		}
 		if(profiler)
 		{
