@@ -9,7 +9,7 @@
 //
 // Usage: mdParallelTransportBenchmark [--mode serial|parallel|default] [--warmup S]
 //        [--seconds S] [--callers N] [--load N] [--prio normal|high|mmcss]
-//        [--profile N] [--paced 0|1] [--latency-blocks N]
+//        [--profile N] [--paced 0|1] [--latency-blocks N] [--model md|mm]
 // MDMM_WORKER_PRIORITY=normal|high overrides the worker's MMCSS registration.
 // --paced 1 runs the blocks at real-time pace like an audio device (a late
 // block is an xrun, the next one starts at the following period) with the
@@ -20,7 +20,8 @@
 // --profile N samples both DSPs' program counters during the measured window
 // and prints the N hottest addresses with the code there, to see where the
 // emulated cycles go (signal processing, or firmware waiting on a peripheral).
-// Needs GEARMULATOR_MD_FIRMWARE_BIN, like the firmware tests.
+// Needs GEARMULATOR_MD_FIRMWARE_BIN, like the firmware tests; --model mm finds
+// the Monomachine ROM in the same folder.
 
 #include "mdAutomationTestSupport.h"
 #include "synthLib/romLoader.h"
@@ -63,6 +64,7 @@ namespace
 		int profile = 0;		// hottest DSP addresses to print, 0 = no profile
 		bool paced = false;		// real-time pacing: report the DAW-meter view
 		int latencyBlocks = -1;	// plug-in latency in blocks, -1 = the device default
+		md::MachineModel model = md::MachineModel::Machinedrum;
 	};
 
 	// Samples the program counters of the two DSPs from its own thread. The
@@ -209,6 +211,8 @@ namespace
 				options.paced = std::stoi(value) != 0;
 			else if(key == "--latency-blocks")
 				options.latencyBlocks = std::stoi(value);
+			else if(key == "--model")
+				options.model = value == "mm" ? md::MachineModel::Monomachine : md::MachineModel::Machinedrum;
 			else
 				throw std::runtime_error("unknown option " + key);
 		}
@@ -406,7 +410,7 @@ int main(const int _argc, char** _argv)
 		if(options.mode != "default")
 			setTransportMode(options.mode);
 
-		Harness harness(md::MachineModel::Machinedrum);
+		Harness harness(options.model);
 		if(!harness.hasLocalFirmware())
 			return SkipReturnCode;
 		if(options.latencyBlocks >= 0)
