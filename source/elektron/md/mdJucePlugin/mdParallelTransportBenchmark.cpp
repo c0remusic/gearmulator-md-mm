@@ -37,6 +37,8 @@
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
+#include <csignal>
+#include <exception>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -246,6 +248,7 @@ namespace
 			std::unordered_map<uint64_t, std::pair<std::string, std::string>> names;	// address -> function, file:line
 			std::unordered_map<std::string, uint64_t> functions, lines;
 			std::unordered_map<DWORD, uint64_t> threads;
+			std::unordered_map<DWORD, std::unordered_map<std::string, uint64_t>> threadFunctions;
 			uint64_t total = 0;
 			alignas(SYMBOL_INFO) char buffer[sizeof(SYMBOL_INFO) + 512];
 			for(const auto& sample : m_samples)
@@ -285,6 +288,7 @@ namespace
 				++total;
 				++threads[sample.thread];
 				++functions[function];
+				++threadFunctions[sample.thread][function];
 				if(!it->second.second.empty())
 					++lines[function + "  " + it->second.second];
 			}
@@ -305,6 +309,20 @@ namespace
 			std::printf("\n");
 			top(functions, "by function");
 			top(lines, "by source line");
+			// The two busiest threads on their own, as shares of that thread.
+			std::vector<std::pair<DWORD, uint64_t>> busy(threads.begin(), threads.end());
+			std::sort(busy.begin(), busy.end(), [](const auto& _a, const auto& _b) { return _a.second > _b.second; });
+			for(size_t t = 0; t < busy.size() && t < 2; ++t)
+			{
+				const auto& map = threadFunctions[busy[t].first];
+				std::vector<std::pair<std::string, uint64_t>> hot(map.begin(), map.end());
+				std::sort(hot.begin(), hot.end(), [](const auto& _a, const auto& _b) { return _a.second > _b.second; });
+				std::printf("mdParallelTransportBenchmark: host profile thread %lu, %llu samples\n", busy[t].first,
+					static_cast<unsigned long long>(busy[t].second));
+				for(int n = 0; n < _top && n < static_cast<int>(hot.size()); ++n)
+					std::printf("  %5.1f%%  %s\n", 100.0 * static_cast<double>(hot[static_cast<size_t>(n)].second)
+						/ static_cast<double>(std::max<uint64_t>(busy[t].second, 1)), hot[static_cast<size_t>(n)].first.c_str());
+			}
 		}
 
 	private:
@@ -363,6 +381,50 @@ namespace
 		std::atomic<bool> m_exit{false};
 		std::thread m_thread;
 	};
+#endif
+
+#ifdef _WIN32
+	// Prints the calling thread's stack with symbols (abort/terminate
+	// diagnostics: a crash of the emulation otherwise leaves no trace).
+	void printStack(const char* _what)
+	{
+		void* frames[62];
+		const USHORT count = CaptureStackBackTrace(0, 62, frames, nullptr);
+		const HANDLE process = GetCurrentProcess();
+		SymSetOptions(SYMOPT_UNDNAME | SYMOPT_DEFERRED_LOADS | SYMOPT_LOAD_LINES);
+		SymInitialize(process, nullptr, TRUE);
+		std::fprintf(stderr, "mdParallelTransportBenchmark: %s on thread %lu\n", _what, GetCurrentThreadId());
+		alignas(SYMBOL_INFO) char buffer[sizeof(SYMBOL_INFO) + 256];
+		for(USHORT i = 0; i < count; ++i)
+		{
+			auto* const symbol = reinterpret_cast<SYMBOL_INFO*>(buffer);
+			symbol->SizeOfStruct = sizeof(SYMBOL_INFO);
+			symbol->MaxNameLen = 255;
+			DWORD64 displacement = 0;
+			const auto address = reinterpret_cast<DWORD64>(frames[i]);
+			IMAGEHLP_LINE64 line{};
+			line.SizeOfStruct = sizeof(line);
+			DWORD lineDisplacement = 0;
+			const bool hasLine = SymGetLineFromAddr64(process, address, &lineDisplacement, &line) != 0;
+			std::fprintf(stderr, "  #%u %s %s:%lu\n", i,
+				SymFromAddr(process, address, &displacement, symbol) ? symbol->Name : "?",
+				hasLine ? line.FileName : "", hasLine ? line.LineNumber : 0);
+		}
+		std::fflush(stderr);
+	}
+
+	void installCrashHandlers()
+	{
+		std::signal(SIGABRT, [](int)
+		{
+			printStack("SIGABRT");
+		});
+		std::set_terminate([]
+		{
+			printStack("std::terminate");
+			std::abort();
+		});
+	}
 #endif
 
 	// Applies an Options::priority to the calling thread; returns the MMCSS
@@ -586,6 +648,9 @@ namespace
 int main(const int _argc, char** _argv)
 {
 	std::setvbuf(stdout, nullptr, _IONBF, 0);
+#ifdef _WIN32
+	installCrashHandlers();
+#endif
 	const auto* const romPath = std::getenv("GEARMULATOR_MD_FIRMWARE_BIN");
 	if(romPath == nullptr || !*romPath)
 	{
