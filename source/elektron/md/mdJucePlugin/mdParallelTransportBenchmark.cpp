@@ -20,6 +20,8 @@
 // --profile N samples both DSPs' program counters during the measured window
 // and prints the N hottest addresses with the code there, to see where the
 // emulated cycles go (signal processing, or firmware waiting on a peripheral).
+// --host-profile N (Windows) samples the host threads and prints the N
+// functions and source lines that take the most host CPU.
 // Needs GEARMULATOR_MD_FIRMWARE_BIN, like the firmware tests; --model mm finds
 // the Monomachine ROM in the same folder.
 
@@ -45,6 +47,16 @@
 #include <unordered_map>
 #include <vector>
 
+#ifdef _WIN32
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#include <tlhelp32.h>
+#include <dbghelp.h>
+#pragma comment(lib, "dbghelp.lib")
+#endif
+
 namespace
 {
 	using namespace mdAutomationTest;
@@ -65,6 +77,7 @@ namespace
 		bool paced = false;		// real-time pacing: report the DAW-meter view
 		int latencyBlocks = -1;	// plug-in latency in blocks, -1 = the device default
 		md::MachineModel model = md::MachineModel::Machinedrum;
+		int hostProfile = 0;	// hottest host functions/lines to print, 0 = off (Windows)
 	};
 
 	// Samples the program counters of the two DSPs from its own thread. The
@@ -132,6 +145,31 @@ namespace
 					std::printf("\n");
 				}
 			}
+			if(const char* const dump = std::getenv("MDMM_BENCH_DSPDUMP"))
+			{
+				// MDMM_BENCH_DSPDUMP=start:end disassembles a P range of both DSPs,
+				// with each address's share of the samples.
+				const auto begin = static_cast<uint32_t>(std::strtoul(dump, nullptr, 16));
+				const char* const colon = std::strchr(dump, ':');
+				const auto end = colon ? static_cast<uint32_t>(std::strtoul(colon + 1, nullptr, 16)) : begin + 0x20;
+				for(size_t i = 0; i < m_dsps.size(); ++i)
+				{
+					auto& dsp = *m_dsps[i];
+					std::printf("mdParallelTransportBenchmark: dspdump %s p:$%06x-$%06x\n", names[i], begin, end);
+					for(uint32_t addr = begin; addr < end;)
+					{
+						const auto op = dsp.memory().get(dsp56k::MemArea_P, addr);
+						const auto opB = dsp.memory().get(dsp56k::MemArea_P, addr + 1);
+						std::string text;
+						const auto len = std::max(1u, dsp.disassembler().disassemble(text, op, opB, 0, 0, addr));
+						const auto found = m_histogram[i].find(addr);
+						const double share = found == m_histogram[i].end() ? 0.0
+							: 100.0 * static_cast<double>(found->second) / static_cast<double>(m_samples);
+						std::printf("  %5.1f%%  p:$%06x  %06x  %s\n", share, addr, op, text.c_str());
+						addr += len;
+					}
+				}
+			}
 			if(!m_uc)
 				return;
 			std::vector<std::pair<uint32_t, uint64_t>> hot(m_ucHistogram.begin(), m_ucHistogram.end());
@@ -175,6 +213,158 @@ namespace
 		std::thread m_thread;
 	};
 
+#ifdef _WIN32
+	// Host-time profile: samples the instruction pointer of every thread of
+	// this process from its own thread (suspend, read the context, resume),
+	// then names the samples through the debug symbols. Unlike PcProfiler,
+	// which shows where the emulated processors spend emulated time, this
+	// shows where the host CPU goes. Threads parked in a system call are left
+	// out; JIT code has no symbols and shows as [jit].
+	class HostProfiler
+	{
+	public:
+		HostProfiler()
+		{
+			m_samples.reserve(8u << 20);
+			m_thread = std::thread([this] { run(); });
+		}
+
+		~HostProfiler() { stop(); }
+
+		void stop()
+		{
+			m_exit.store(true);
+			if(m_thread.joinable())
+				m_thread.join();
+		}
+
+		void print(const int _top)
+		{
+			const HANDLE process = GetCurrentProcess();
+			SymSetOptions(SYMOPT_UNDNAME | SYMOPT_DEFERRED_LOADS | SYMOPT_LOAD_LINES);
+			SymInitialize(process, nullptr, TRUE);
+			std::unordered_map<uint64_t, std::pair<std::string, std::string>> names;	// address -> function, file:line
+			std::unordered_map<std::string, uint64_t> functions, lines;
+			std::unordered_map<DWORD, uint64_t> threads;
+			uint64_t total = 0;
+			alignas(SYMBOL_INFO) char buffer[sizeof(SYMBOL_INFO) + 512];
+			for(const auto& sample : m_samples)
+			{
+				auto it = names.find(sample.rip);
+				if(it == names.end())
+				{
+					std::string function = "[jit]", line;
+					if(SymGetModuleBase64(process, sample.rip))
+					{
+						auto* const symbol = reinterpret_cast<SYMBOL_INFO*>(buffer);
+						symbol->SizeOfStruct = sizeof(SYMBOL_INFO);
+						symbol->MaxNameLen = 511;
+						DWORD64 displacement = 0;
+						function = SymFromAddr(process, sample.rip, &displacement, symbol) ? symbol->Name : "[unknown]";
+						IMAGEHLP_LINE64 info{};
+						info.SizeOfStruct = sizeof(info);
+						DWORD lineDisplacement = 0;
+						if(SymGetLineFromAddr64(process, sample.rip, &lineDisplacement, &info))
+						{
+							std::string file = info.FileName;
+							const auto slash = file.find_last_of("\\/");
+							if(slash != std::string::npos)
+								file = file.substr(slash + 1);
+							line = file + ":" + std::to_string(info.LineNumber);
+						}
+					}
+					it = names.emplace(sample.rip, std::make_pair(function, line)).first;
+				}
+				const auto& function = it->second.first;
+				// A thread parked in the kernel sits on its system call stub.
+				if((function.rfind("Nt", 0) == 0 || function.rfind("Zw", 0) == 0) && function.find("Wait") != std::string::npos)
+					continue;
+				if(function == "NtDelayExecution" || function == "ZwDelayExecution" || function == "NtRemoveIoCompletion"
+					|| function == "ZwRemoveIoCompletion" || function == "NtWaitForAlertByThreadId")
+					continue;
+				++total;
+				++threads[sample.thread];
+				++functions[function];
+				if(!it->second.second.empty())
+					++lines[function + "  " + it->second.second];
+			}
+			SymCleanup(process);
+			const auto top = [&](const std::unordered_map<std::string, uint64_t>& _map, const char* _title)
+			{
+				std::vector<std::pair<std::string, uint64_t>> hot(_map.begin(), _map.end());
+				std::sort(hot.begin(), hot.end(), [](const auto& _a, const auto& _b) { return _a.second > _b.second; });
+				std::printf("mdParallelTransportBenchmark: host profile %s, %llu running samples\n", _title,
+					static_cast<unsigned long long>(total));
+				for(int n = 0; n < _top && n < static_cast<int>(hot.size()); ++n)
+					std::printf("  %5.1f%%  %s\n", 100.0 * static_cast<double>(hot[static_cast<size_t>(n)].second)
+						/ static_cast<double>(std::max<uint64_t>(total, 1)), hot[static_cast<size_t>(n)].first.c_str());
+			};
+			std::printf("mdParallelTransportBenchmark: host profile threads:");
+			for(const auto& [id, count] : threads)
+				std::printf(" %lu=%.1f%%", id, 100.0 * static_cast<double>(count) / static_cast<double>(std::max<uint64_t>(total, 1)));
+			std::printf("\n");
+			top(functions, "by function");
+			top(lines, "by source line");
+		}
+
+	private:
+		struct Sample { uint64_t rip; DWORD thread; };
+
+		void run()
+		{
+			const DWORD self = GetCurrentThreadId();
+			std::vector<std::pair<DWORD, HANDLE>> threads;
+			auto refresh = Clock::now();
+			const auto enumerate = [&]
+			{
+				for(auto& [id, handle] : threads)
+					CloseHandle(handle);
+				threads.clear();
+				const HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
+				THREADENTRY32 entry{};
+				entry.dwSize = sizeof(entry);
+				for(BOOL ok = Thread32First(snapshot, &entry); ok; ok = Thread32Next(snapshot, &entry))
+				{
+					if(entry.th32OwnerProcessID != GetCurrentProcessId() || entry.th32ThreadID == self)
+						continue;
+					if(const HANDLE handle = OpenThread(THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT, FALSE, entry.th32ThreadID))
+						threads.emplace_back(entry.th32ThreadID, handle);
+				}
+				CloseHandle(snapshot);
+			};
+			enumerate();
+			while(!m_exit.load(std::memory_order_relaxed))
+			{
+				for(const auto& [id, handle] : threads)
+				{
+					// Nothing may allocate while the thread is suspended: it may
+					// hold the heap lock.
+					if(SuspendThread(handle) == static_cast<DWORD>(-1))
+						continue;
+					CONTEXT context{};
+					context.ContextFlags = CONTEXT_CONTROL;
+					const bool ok = GetThreadContext(handle, &context) != 0;
+					ResumeThread(handle);
+					if(ok && m_samples.size() < m_samples.capacity())
+						m_samples.push_back({context.Rip, id});
+				}
+				if(Clock::now() - refresh > std::chrono::milliseconds(500))
+				{
+					enumerate();
+					refresh = Clock::now();
+				}
+				std::this_thread::sleep_for(std::chrono::microseconds(500));
+			}
+			for(auto& [id, handle] : threads)
+				CloseHandle(handle);
+		}
+
+		std::vector<Sample> m_samples;
+		std::atomic<bool> m_exit{false};
+		std::thread m_thread;
+	};
+#endif
+
 	// Applies an Options::priority to the calling thread; returns the MMCSS
 	// token to release when the thread ends.
 	void* applyPriority(const std::string& _priority)
@@ -211,6 +401,8 @@ namespace
 				options.paced = std::stoi(value) != 0;
 			else if(key == "--latency-blocks")
 				options.latencyBlocks = std::stoi(value);
+			else if(key == "--host-profile")
+				options.hostProfile = std::max(0, std::stoi(value));
 			else if(key == "--model")
 				options.model = value == "mm" ? md::MachineModel::Monomachine : md::MachineModel::Machinedrum;
 			else
@@ -438,6 +630,11 @@ int main(const int _argc, char** _argv)
 						&device->getHardware().getDspProducer().dsp()}, &device->getHardware().getUC());
 			});
 		}
+#ifdef _WIN32
+		std::unique_ptr<HostProfiler> hostProfiler;
+		if(options.hostProfile > 0)
+			hostProfiler = std::make_unique<HostProfiler>();
+#endif
 		const auto asyncStats = [&]
 		{
 			md::AsyncRender::Stats stats{};
@@ -580,6 +777,13 @@ int main(const int _argc, char** _argv)
 			profiler->stop();
 			profiler->print(options.profile);
 		}
+#ifdef _WIN32
+		if(hostProfiler)
+		{
+			hostProfiler->stop();
+			hostProfiler->print(options.hostProfile);
+		}
+#endif
 
 		const int64_t deadlineNs = static_cast<int64_t>(1e9 * BlockSize / 48000.0);
 		const auto late = std::count_if(durations.begin(), durations.end(),
