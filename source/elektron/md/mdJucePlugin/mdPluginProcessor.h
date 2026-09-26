@@ -59,7 +59,7 @@ namespace mdJucePlugin
 		// Parallel transport setting (Machinedrum only; on by default). The
 		// config value is the source of truth; apply pushes it to the device.
 		static constexpr const char* ParallelTransportConfigKey = "parallelTransport";
-		bool supportsParallelTransport() const { return m_model == md::MachineModel::Machinedrum; }
+		bool supportsParallelTransport() const { return true; }
 		bool getParallelTransportSetting();
 		void applyParallelTransportSetting();
 		// The device follows the setting now, or will after a reload.

@@ -35,7 +35,7 @@ namespace mdJucePlugin
 			if(auto* const holder = standaloneHolder(m_processor))
 				holder->showAudioSettingsDialog();
 		});
-		// The Machinedrum page carries the transport switch; the toggle writes
+		// Both machines' pages carry the transport switch; the toggle writes
 		// the config value, the processor pushes it to the device.
 		auto& processor = static_cast<AudioPluginAudioProcessor&>(m_processor);
 		if(processor.supportsParallelTransport())
