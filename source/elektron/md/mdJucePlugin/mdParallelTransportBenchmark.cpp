@@ -22,6 +22,8 @@
 // emulated cycles go (signal processing, or firmware waiting on a peripheral).
 // --host-profile N (Windows) samples the host threads and prints the N
 // functions and source lines that take the most host CPU.
+// --rate HZ sets the host sample rate (default 48000; 44100 runs without
+// resampling).
 // Needs GEARMULATOR_MD_FIRMWARE_BIN, like the firmware tests; --model mm finds
 // the Monomachine ROM in the same folder.
 
@@ -80,6 +82,7 @@ namespace
 		int latencyBlocks = -1;	// plug-in latency in blocks, -1 = the device default
 		md::MachineModel model = md::MachineModel::Machinedrum;
 		int hostProfile = 0;	// hottest host functions/lines to print, 0 = off (Windows)
+		int sampleRate = 48000;	// host sample rate
 	};
 
 	// Samples the program counters of the two DSPs from its own thread. The
@@ -95,10 +98,24 @@ namespace
 			m_thread = std::thread([this]
 			{
 				auto next = Clock::now();
+				std::array<uint64_t, 2> lastCycles{};
 				while(!m_exit.load(std::memory_order_relaxed))
 				{
 					for(size_t i = 0; i < m_dsps.size(); ++i)
-						++m_histogram[i][m_dsps[i]->getPC().toWord()];
+					{
+						const auto pc = m_dsps[i]->getPC().toWord();
+						++m_histogram[i][pc];
+						// A DSP whose cycle counter moved since the last sample ran in
+						// between: these samples weigh each block by host time, while
+						// the ones above also count where a stopped DSP waits.
+						const auto cycles = m_dsps[i]->getCycles();
+						if(cycles != lastCycles[i])
+						{
+							++m_runHistogram[i][pc];
+							++m_runSamples[i];
+							lastCycles[i] = cycles;
+						}
+					}
 					if(m_uc)
 						++m_ucHistogram[m_uc->getPC()];
 					++m_samples;
@@ -121,18 +138,22 @@ namespace
 		void print(const int _top)
 		{
 			static const char* const names[] = {"DSP1 mixer", "DSP2 producer"};
-			for(size_t i = 0; i < m_dsps.size(); ++i)
+			for(size_t h = 0; h < 2 * m_dsps.size(); ++h)
 			{
-				std::vector<std::pair<uint32_t, uint64_t>> hot(m_histogram[i].begin(), m_histogram[i].end());
+				const size_t i = h % m_dsps.size();
+				const bool running = h >= m_dsps.size();
+				const auto& histogram = running ? m_runHistogram[i] : m_histogram[i];
+				const uint64_t samples = running ? m_runSamples[i] : m_samples;
+				std::vector<std::pair<uint32_t, uint64_t>> hot(histogram.begin(), histogram.end());
 				std::sort(hot.begin(), hot.end(), [](const auto& _a, const auto& _b) { return _a.second > _b.second; });
-				std::printf("mdParallelTransportBenchmark: profile %s, %llu samples, %zu distinct addresses\n",
-					names[i], static_cast<unsigned long long>(m_samples), hot.size());
+				std::printf("mdParallelTransportBenchmark: profile %s%s, %llu samples, %zu distinct addresses\n",
+					names[i], running ? " while running" : "", static_cast<unsigned long long>(samples), hot.size());
 				auto& dsp = *m_dsps[i];
 				for(int n = 0; n < _top && n < static_cast<int>(hot.size()); ++n)
 				{
 					const uint32_t pc = hot[static_cast<size_t>(n)].first;
 					std::printf("  %5.1f%%  p:$%06x", 100.0 * static_cast<double>(hot[static_cast<size_t>(n)].second)
-						/ static_cast<double>(m_samples), pc);
+						/ static_cast<double>(std::max<uint64_t>(samples, 1)), pc);
 					// The first few instructions of the block.
 					uint32_t addr = pc;
 					for(int k = 0; k < 4; ++k)
@@ -210,6 +231,8 @@ namespace
 		mc68k::Mc68k* m_uc = nullptr;
 		std::unordered_map<uint32_t, uint64_t> m_ucHistogram;
 		std::array<std::unordered_map<uint32_t, uint64_t>, 2> m_histogram;
+		std::array<std::unordered_map<uint32_t, uint64_t>, 2> m_runHistogram;
+		std::array<uint64_t, 2> m_runSamples{};
 		uint64_t m_samples = 0;
 		std::atomic<bool> m_exit{false};
 		std::thread m_thread;
@@ -465,6 +488,8 @@ namespace
 				options.latencyBlocks = std::stoi(value);
 			else if(key == "--host-profile")
 				options.hostProfile = std::max(0, std::stoi(value));
+			else if(key == "--rate")
+				options.sampleRate = std::max(8000, std::stoi(value));
 			else if(key == "--model")
 				options.model = value == "mm" ? md::MachineModel::Monomachine : md::MachineModel::Machinedrum;
 			else
@@ -672,14 +697,14 @@ int main(const int _argc, char** _argv)
 			return SkipReturnCode;
 		if(options.latencyBlocks >= 0)
 			harness.processor.setLatencyBlocks(static_cast<uint32_t>(options.latencyBlocks));
-		harness.prepare();
+		harness.prepare(static_cast<double>(options.sampleRate));
 		// A paced run stands for a DAW in playback: a realtime host, whose
 		// controller work runs on the message thread and not in the audio
 		// callback (the harness defaults to non-realtime for the tests).
 		if(options.paced)
 			harness.audioProcessor.setNonRealtime(false);
 
-		const int blocksPerSecond = 48000 / BlockSize;
+		const int blocksPerSecond = options.sampleRate / BlockSize;
 		CallerPool pool(options.callers, harness, options.priority);
 		pool.process(options.warmupSeconds * blocksPerSecond);
 
@@ -728,7 +753,7 @@ int main(const int _argc, char** _argv)
 			Load load(options.load, options.priority);
 			const auto start = Clock::now();
 			durations = pool.process(blocks, options.paced
-				? std::chrono::nanoseconds(static_cast<int64_t>(1e9 * BlockSize / 48000.0))
+				? std::chrono::nanoseconds(static_cast<int64_t>(1e9 * BlockSize / static_cast<double>(options.sampleRate)))
 				: std::chrono::nanoseconds(0));
 			wall = std::chrono::duration<double>(Clock::now() - start).count();
 		}
@@ -737,7 +762,7 @@ int main(const int _argc, char** _argv)
 			const auto jobs = asyncAfter.jobs - asyncBefore.jobs;
 			if(jobs)
 			{
-				const double period = 1e9 * BlockSize / 48000.0;
+				const double period = 1e9 * BlockSize / static_cast<double>(options.sampleRate);
 				std::printf("mdParallelTransportBenchmark: async jobs=%llu render mean=%.1f%% of period, "
 					"host wait mean=%.1f%% of period, max job frames=%llu backlog mean=%.2f max=%llu render idle=%.1f%% of wall "
 					"queue=%.1fus/job\n",
@@ -816,7 +841,7 @@ int main(const int _argc, char** _argv)
 		{
 			// What a DAW CPU meter shows: time inside the plug-in's process
 			// call as a share of the buffer period.
-			const double period = 1e9 * BlockSize / 48000.0;
+			const double period = 1e9 * BlockSize / static_cast<double>(options.sampleRate);
 			double sum = 0.0;
 			for(const auto d : durations)
 				sum += static_cast<double>(d);
@@ -850,7 +875,7 @@ int main(const int _argc, char** _argv)
 		}
 #endif
 
-		const int64_t deadlineNs = static_cast<int64_t>(1e9 * BlockSize / 48000.0);
+		const int64_t deadlineNs = static_cast<int64_t>(1e9 * BlockSize / static_cast<double>(options.sampleRate));
 		const auto late = std::count_if(durations.begin(), durations.end(),
 			[&](const int64_t _ns) { return _ns > deadlineNs; });
 		uint64_t underflow = 0, overflow = 0;
@@ -866,7 +891,7 @@ int main(const int _argc, char** _argv)
 			"realtime=%.1f%% block p50=%.3fms p99=%.3fms max=%.3fms late=%lld/%d adc=%llu/%llu\n",
 			options.mode.c_str(), options.priority.c_str(),
 			options.callers, options.load, options.seconds, wall,
-			100.0 * wall / options.seconds,
+			100.0 * wall * options.sampleRate / (static_cast<double>(blocks) * BlockSize),
 			static_cast<double>(percentile(durations, 0.5)) / 1e6,
 			static_cast<double>(percentile(durations, 0.99)) / 1e6,
 			static_cast<double>(*std::max_element(durations.begin(), durations.end())) / 1e6,

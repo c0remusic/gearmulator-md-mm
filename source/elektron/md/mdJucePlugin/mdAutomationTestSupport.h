@@ -104,11 +104,11 @@ namespace mdAutomationTest
 				});
 		}
 
-		void prepare()
+		void prepare(const double _sampleRate = 48000.0)
 		{
 			if(prepared)
 				return;
-			audioProcessor.prepareToPlay(48000.0, BlockSize);
+			audioProcessor.prepareToPlay(_sampleRate, BlockSize);
 			prepared = true;
 		}
 
