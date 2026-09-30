@@ -1,5 +1,6 @@
 #include "mddevice.h"
 
+#include "mdenv.h"
 #include "mdstate.h"
 #include "mdromloader.h"
 #include "mdtypes.h"
@@ -742,8 +743,8 @@ namespace md
 
 	TransportMode Device::preferredTransport() const
 	{
-		if(const char* const mode = std::getenv("MDMM_TRANSPORT"))
-			return parseTransportMode(mode);
+		if(const auto mode = parseTransportMode(std::getenv("MDMM_TRANSPORT")))
+			return *mode;
 		if(!m_parallelTransport)
 			return TransportMode::Serial;
 		// The Monomachine's DSPs exchange a strobe request and a burst reply on
@@ -772,9 +773,12 @@ namespace md
 
 	uint32_t Device::getDefaultLatencyBlocks() const
 	{
-		if(const char* const blocks = std::getenv("MDMM_LATENCY_BLOCKS"))
-			return static_cast<uint32_t>(std::strtoul(blocks, nullptr, 10));
-		return 0;
+		return latencyBlocksFromEnvironment().value_or(0);
+	}
+
+	std::optional<uint32_t> Device::latencyBlocksFromEnvironment()
+	{
+		return envCount<uint32_t>("MDMM_LATENCY_BLOCKS");
 	}
 
 	Device::~Device()

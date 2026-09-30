@@ -1,6 +1,7 @@
 #pragma once
 
 #include <memory>
+#include <optional>
 #include <string>
 #include <utility>
 
@@ -118,7 +119,8 @@ namespace md
 		// Monomachine's DSPs, on a worker thread. Turning it on takes effect at
 		// the scheduler's next safe point; turning it off only for a machine
 		// booted later, since the worker never hands the DSPs back. MDMM_TRANSPORT,
-		// when set, overrides this (tests, A/B runs). Call with the device paused.
+		// when set to serial, parallel or pair, overrides this (tests, A/B runs).
+		// Call with the device paused.
 		void setParallelTransport(bool _enabled);
 		bool isParallelTransportRequested() const { return preferredTransport() != TransportMode::Serial; }
 		bool isParallelTransportActive() const { return m_hardware->isProducerThreaded(); }
@@ -176,6 +178,8 @@ namespace md
 		// Zero keeps rendering synchronous; any latency renders on AsyncRender.
 		// MDMM_LATENCY_BLOCKS overrides the default (tests, A/B runs).
 		uint32_t getDefaultLatencyBlocks() const override;
+		// MDMM_LATENCY_BLOCKS, or none when unset, empty or not a count.
+		static std::optional<uint32_t> latencyBlocksFromEnvironment();
 		uint32_t getInternalLatencyInputToOutput() const override
 		{
 			return g_hostAudioInputSafetyFrames;

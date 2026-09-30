@@ -252,6 +252,19 @@ if(BUILD_TESTING)
 		FIXTURES_REQUIRED MdTransportScorecard)
 endif()
 
+add_executable(mdTransportModeTest transportModeTest.cpp)
+target_link_libraries(mdTransportModeTest PRIVATE mdLib)
+add_test(NAME mdTransportModeTest COMMAND mdTransportModeTest)
+set_tests_properties(mdTransportModeTest PROPERTIES
+	LABELS "UnitTest;Transport" TIMEOUT 10 FIXTURES_SETUP MdTransportMode)
+set_property(TARGET mdTransportModeTest PROPERTY FOLDER "Elektron/test")
+if(BUILD_TESTING)
+	add_dependencies(mdLibTest mdTransportModeTest)
+	add_dependencies(mdAudioQueueTest mdTransportModeTest)
+	set_property(TEST mdLibTests mdAudioQueueTest APPEND PROPERTY
+		FIXTURES_REQUIRED MdTransportMode)
+endif()
+
 if(MD_TRANSPORT_DIAGNOSTICS)
 	add_executable(mdTransportScorecardFirmwareTest
 		transportScorecardFirmwareTest.cpp)
@@ -294,6 +307,19 @@ set_tests_properties(mmDigiproFirmwareTest mmDigiproEnsembleFirmwareTest PROPERT
 	LABELS "Integration;FirmwareTest;AudioIo" SKIP_RETURN_CODE 77 TIMEOUT 600)
 set_tests_properties(mmSineOracleTest PROPERTIES
 	LABELS "UnitTest;AudioIo" FIXTURES_SETUP MmAudioOracle TIMEOUT 10)
+# Both pair leads at zero once stopped the machine at the pair handoff, the
+# UC waiting for a DSP to pass it and the DSPs gated at the UC. The handoff
+# comes early in the 20 s boot, so a short listen is enough; a hang times out.
+add_test(NAME mmPairZeroLeadFirmwareTest COMMAND mmAudioFirmwareTest --listen)
+set_tests_properties(mmPairZeroLeadFirmwareTest PROPERTIES
+	LABELS "Integration;FirmwareTest;AudioIo;Transport" SKIP_RETURN_CODE 77 TIMEOUT 120
+	ENVIRONMENT "MDMM_TRANSPORT=pair;MD_PAIR_LEAD_US=0;MD_PAIR_UC_LEAD_US=0;MM_LISTEN_LONE_MIXER=1;MM_LISTEN_SECONDS=2")
+# The DSP2 hold takes the DSP lead to zero during a round trip: with the UC
+# lead at zero too it stopped the machine the same way, early in the boot.
+add_test(NAME mmPairHoldZeroUcLeadFirmwareTest COMMAND mmAudioFirmwareTest --listen)
+set_tests_properties(mmPairHoldZeroUcLeadFirmwareTest PROPERTIES
+	LABELS "Integration;FirmwareTest;AudioIo;Transport" SKIP_RETURN_CODE 77 TIMEOUT 120
+	ENVIRONMENT "MDMM_TRANSPORT=pair;MD_PAIR_HOLD_DSP2_US=30;MD_PAIR_UC_LEAD_US=0;MM_LISTEN_LONE_MIXER=1;MM_LISTEN_SECONDS=2")
 set_property(TARGET mmAudioFirmwareTest PROPERTY FOLDER "Elektron/test")
 
 if(BUILD_TESTING)

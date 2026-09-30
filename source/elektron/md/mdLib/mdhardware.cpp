@@ -1,4 +1,5 @@
 #include "mdhardware.h"
+#include "mdenv.h"
 #include "mdhostclock.h"
 #include "mdrampacking.h"
 #include "mdtransportpolicy.h"
@@ -134,13 +135,13 @@ namespace md
 		const auto* const boundedJit = std::getenv("GEARMULATOR_MDMM_BOUNDED_JIT");
 		m_schedBoundedJit = boundedJit == nullptr || std::strcmp(boundedJit, "0") != 0;
 		m_linkPipelineDepthFrames = transportPolicy(m_model).linkPipelineDepthFrames;
-		if(const char* const depth = std::getenv("MD_LINK_PIPELINE_DEPTH"))
-			m_linkPipelineDepthFrames = std::max(0.0, std::atof(depth));
-		if(const char* const mode = std::getenv("MDMM_TRANSPORT"))
-			m_transportMode = parseTransportMode(mode);
-		if(const char* const help = std::getenv("MDMM_PRODUCER_HELP_US"))
-			m_producerHelpDelayUs = static_cast<uint32_t>(std::strtoul(help, nullptr, 10));
-		m_transportTrace = std::getenv("MDMM_TRANSPORT_TRACE") != nullptr;
+		if(const auto depth = envNumber("MD_LINK_PIPELINE_DEPTH"))
+			m_linkPipelineDepthFrames = std::max(0.0, *depth);
+		if(const auto mode = parseTransportMode(std::getenv("MDMM_TRANSPORT")))
+			m_transportMode = *mode;
+		if(const auto help = envCount<uint32_t>("MDMM_PRODUCER_HELP_US"))
+			m_producerHelpDelayUs = *help;
+		m_transportTrace = envOverride("MDMM_TRANSPORT_TRACE") != nullptr;
 		if(m_transportTrace)
 			startWatchdog();
 
@@ -203,9 +204,12 @@ namespace md
 					.getLastTxWrittenMask() != 0;
 				// Content offset applies to the producer->mixer direction only;
 				// the back-channel is causal. Boot traffic (origin not latched
-				// yet) stays undated.
-				entry.dueFrames = (_selfDsp == 1 && m_schedDspOriginLatched[1])
-					? schedDspFramePos(1) + m_linkPipelineDepthFrames : 0.0;
+				// yet) stays undated. The catch-up below reuses the producer's
+				// position: nothing runs in between.
+				std::optional<double> producerPos;
+				if(_selfDsp == 1 && m_schedDspOriginLatched[1])
+					producerPos = schedDspFramePos(1);
+				entry.dueFrames = producerPos ? *producerPos + m_linkPipelineDepthFrames : 0.0;
 				auto& ring = m_linkRing[1u - _selfDsp];
 				const bool mdProducerToMixer = _selfDsp == 1 && !isMonomachine();
 				const bool rendezvousActiveBefore = mdProducerToMixer
@@ -260,7 +264,7 @@ namespace md
 								score.maximumRingDepth = std::max(score.maximumRingDepth, ring.size()););
 						}
 						if(dspsShareThread())
-							schedCatchUpDspToDsp(1u - _selfDsp, _selfDsp);
+							schedCatchUpDspToDsp(1u - _selfDsp, _selfDsp, producerPos);
 						++_frameIndex;
 						return;
 					}
@@ -280,7 +284,7 @@ namespace md
 					// other inline: the dated ring and the pop-side wait replace
 					// the rendezvous. Two DSPs sharing a thread keep it.
 					if(dspsShareThread())
-						schedCatchUpDspToDsp(1u - _selfDsp, _selfDsp);
+						schedCatchUpDspToDsp(1u - _selfDsp, _selfDsp, producerPos);
 
 					// Every gate that used to read CONSUMER state here (receive
 					// window epochs, receiver-overrun on RDF, post-flush
@@ -312,9 +316,21 @@ namespace md
 				// The mixer path normally disposes in the availability
 				// callback; this covers consumers polled without one. Never
 				// an RX-tick ROE site: the availability probe owns that.
-				linkDisposeAtConsumer(_selfDsp, false);
+				// When that probe ran in this very slot (linkRxAvailable),
+				// disposing again would change nothing: take its position.
+				auto& tick = m_linkRxTick[_selfDsp].value;
+				double now;
+				if(tick.cycles == ((_selfDsp == 0) ? m_dspMixer : m_dspProducer).dsp().getCycles())
+				{
+					now = tick.now;
+				}
+				else
+				{
+					linkDisposeAtConsumer(_selfDsp, false);
+					now = linkConsumerNow(_selfDsp);
+				}
+				tick.cycles = ~0ull;
 				auto& ring = m_linkRing[_selfDsp];
-				const double now = linkConsumerNow(_selfDsp);
 					// Stall recovery: under scheduler link catch-up the consumer is
 					// advanced to the producer's time before every enqueue, so this ring can only be
 					// DEEP if the consumer's RX stopped clocking for a while as the wire kept running
@@ -1232,6 +1248,12 @@ namespace md
 			&& ring.front().dueFrames <= linkConsumerNow(_consumer);
 	}
 
+	bool Hardware::linkHeadDue(const uint32_t _consumer, const double _now)
+	{
+		const auto& ring = m_linkRing[_consumer];
+		return !ring.empty() && ring.front().dueFrames <= _now;
+	}
+
 	void Hardware::mdLinkWindowFlushed()
 	{
 		if(!m_mdLink.roeEngaged.load(std::memory_order_acquire))
@@ -1634,11 +1656,7 @@ namespace md
 		double schedQuantumFrames(const MachineModel _model)
 		{
 			// MD_BACKGROUND_QUANTUM_US overrides the policy for experiments.
-			static const double s_override = []
-			{
-				const char* const us = std::getenv("MD_BACKGROUND_QUANTUM_US");
-				return us ? std::atof(us) : 0.0;
-			}();
+			static const double s_override = envNumber("MD_BACKGROUND_QUANTUM_US").value_or(0.0);
 			const double us = s_override > 0.0 ? s_override : transportPolicy(_model).backgroundQuantumMicroseconds;
 			return us * static_cast<double>(g_samplerate) / 1.0e6;				// -> codec frames
 		}
@@ -2168,11 +2186,7 @@ namespace md
 		// scheduler it lands nearly every UC word at the full lead, plus up to
 		// a chunk (transportPolicy). MD_PAIR_LEAD_US and MD_PAIR_UC_LEAD_US
 		// override them.
-		const auto envUs = [](const char* _name)
-		{
-			const char* const value = std::getenv(_name);
-			return value ? std::atof(value) : -1.0;
-		};
+		const auto envUs = [](const char* _name) { return envNumber(_name).value_or(-1.0); };
 		const auto usToFrames = [](const double _us) { return _us * static_cast<double>(g_samplerate) / 1.0e6; };
 		const auto policy = transportPolicy(m_model);
 		m_pairQuantumFrames = schedQuantumFrames(m_model);
@@ -2181,15 +2195,33 @@ namespace md
 		m_pairDspLeadUc = static_cast<uint64_t>(dspLeadFrames * schedUcCyclesPerFrame());
 		const double ucLeadUs = envUs("MD_PAIR_UC_LEAD_US");
 		m_pairUcLeadFrames = ucLeadUs >= 0.0 ? usToFrames(ucLeadUs) : m_pairQuantumFrames;
-		if(const char* const minChunk = std::getenv("MD_PAIR_MIN_CHUNK"))
-			m_pairMinChunkCycles = std::max<uint64_t>(1, std::strtoull(minChunk, nullptr, 10));
+		if(const auto minChunk = envCount<uint64_t>("MD_PAIR_MIN_CHUNK"))
+			m_pairMinChunkCycles = std::max<uint64_t>(1, *minChunk);
 		// DSP2 round-trip hold (pairDspLeadUc), window in microseconds of UC
 		// time. MD_PAIR_HOLD_DSP2_US overrides the policy; negative disables.
-		const char* const holdEnv = std::getenv("MD_PAIR_HOLD_DSP2_US");
-		const double holdDsp2Us = holdEnv ? std::atof(holdEnv) : policy.pairHoldDsp2Microseconds;
+		const double holdDsp2Us = envNumber("MD_PAIR_HOLD_DSP2_US").value_or(policy.pairHoldDsp2Microseconds);
 		m_pairHoldDsp2 = isMonomachine() && holdDsp2Us >= 0.0;
 		m_pairHoldDsp2Uc = m_pairHoldDsp2
 			? static_cast<uint64_t>(usToFrames(holdDsp2Us) * schedUcCyclesPerFrame()) : 0;
+		// The gates must not close on each other. The UC waits until the slower
+		// DSP is within the UC lead of it; a DSP's UC gate lets it pass the UC
+		// by the DSP lead at most (hostToDspDeadline rounds down), and by
+		// nothing during a DSP2 hold. With both leads at zero the UC waits for
+		// a DSP to pass it, which the gate forbids, and the machine stops at
+		// the handoff. Where the DSP lead can be zero, the UC therefore leads
+		// by at least one worker chunk plus the cycle the deadline rounds away:
+		// the slower DSP then always has a whole chunk to run while the UC waits.
+		if(!m_pairDspLeadUc || m_pairHoldDsp2)
+		{
+			const double minUcLeadFrames = static_cast<double>(m_pairMinChunkCycles + 1)
+				/ static_cast<double>(g_dsp1CyclesPerEsaiFrame);
+			if(m_pairUcLeadFrames < minUcLeadFrames)
+			{
+				std::fprintf(stderr, "[pair] UC lead raised from %.2f to %.2f us: with no DSP lead the gates would close\n",
+					m_pairUcLeadFrames * 1.0e6 / g_samplerate, minUcLeadFrames * 1.0e6 / g_samplerate);
+				m_pairUcLeadFrames = minUcLeadFrames;
+			}
+		}
 		// Placement. auto keeps this (UC) thread on the physical core it runs on
 		// and the worker on the other cores sharing its last-level cache: on a
 		// Ryzen 3700X that is ~80% of real time for the Monomachine against
@@ -2198,7 +2230,7 @@ namespace md
 		// host's audio thread. MDMM_PAIR_AFFINITY overrides: auto, off, worker
 		// (the worker alone, which measured no gain), or u,w to pin this thread
 		// to logical CPU u and the worker to w.
-		const char* affinity = std::getenv("MDMM_PAIR_AFFINITY");
+		const char* affinity = envOverride("MDMM_PAIR_AFFINITY");
 		if(!affinity)
 			affinity = m_pairPlacementAllowed.load(std::memory_order_relaxed) ? "auto" : "off";
 		if(std::strcmp(affinity, "off") != 0)
@@ -2217,15 +2249,18 @@ namespace md
 			}
 			else
 			{
+				// A side without digits pins nothing: strtoul reads it as CPU 0.
 				char* end = nullptr;
 				const auto uc = std::strtoul(affinity, &end, 10);
+				const bool ucGiven = end != affinity;
 				if(end && *end == ',')
 				{
-					const auto worker = std::strtoul(end + 1, nullptr, 10);
-					if(worker < 64)
+					char* workerEnd = nullptr;
+					const auto worker = std::strtoul(end + 1, &workerEnd, 10);
+					if(workerEnd != end + 1 && worker < 64)
 						m_pairWorkerAffinity = uint64_t{1} << worker;
 				}
-				if(uc < 64)
+				if(ucGiven && uc < 64)
 					dsp56k::ThreadTools::setCurrentThreadAffinity(uint64_t{1} << uc);
 			}
 		}
@@ -2358,7 +2393,20 @@ namespace md
 		const uint64_t hostEvent = d.nextHostTransportCycle();
 		if(hostEvent > now)
 			stopCyc = std::min(stopCyc, hostEvent);
+#ifdef DSP56K_TSC_PROBES
+		const uint64_t probeCycles[2] = {m_dspMixer.dsp().getCycles(), m_dspProducer.dsp().getCycles()};
+		{
+			DSP_PROBE_SCOPE(0, Exec, i);
+			d.dsp().execUntilCycles(stopCyc);
+		}
+		if(auto* const probeCtx = dsp56k::probe::t_ctx)
+		{
+			probeCtx->cycles[i][0] += ((i == 0) ? m_dspMixer : m_dspProducer).dsp().getCycles() - probeCycles[i];
+			probeCtx->cycles[i ^ 1][1] += ((i == 0) ? m_dspProducer : m_dspMixer).dsp().getCycles() - probeCycles[i ^ 1];
+		}
+#else
 		d.dsp().execUntilCycles(stopCyc);
+#endif
 		// Both: the link catch-ups inside may have run the other DSP too.
 		m_dspMixer.publishHostStatus();
 		m_dspProducer.publishHostStatus();
@@ -2366,6 +2414,137 @@ namespace md
 		m_schedPublished.dspCycles[1].store(m_dspProducer.dsp().getCycles(), std::memory_order_release);
 		m_signal.notify();
 	}
+
+#ifdef DSP56K_TSC_PROBES
+	namespace
+	{
+		// Pair worker TSC probe session (dsp56kBase/tscprobe.h): installed for the
+		// worker's lifetime, reported to stderr when the worker exits.
+		struct PairProbeSession
+		{
+			dsp56k::probe::Ctx ctx;
+			dsp56k::DSP* dsps[2];
+			dsp56k::probe::Counters start[2];
+			uint64_t tscStart = 0;
+			std::chrono::steady_clock::time_point wallStart;
+
+			PairProbeSession(dsp56k::DSP& _mixer, dsp56k::DSP& _producer) : dsps{&_mixer, &_producer}
+			{
+				ctx.level = envCount<uint8_t>("DSP56K_PROBE_LEVEL").value_or(1);
+				dsp56k::probe::t_ctx = &ctx;
+				dsp56k::probe::calibrate(ctx);
+				start[0] = _mixer.probeCounters();
+				start[1] = _producer.probeCounters();
+				wallStart = std::chrono::steady_clock::now();
+				tscStart = dsp56k::probe::now();
+				ctx.last = tscStart;
+			}
+
+			~PairProbeSession()
+			{
+				using namespace dsp56k::probe;
+				const uint64_t tscEnd = now();
+				ctx.bucket(ctx.curDsp, ctx.curCat).self += tscEnd - ctx.last;
+				t_ctx = nullptr;
+				const double wallNs = static_cast<double>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+					std::chrono::steady_clock::now() - wallStart).count());
+				const double ticks = static_cast<double>(tscEnd - tscStart);
+				const double nsPerTick = wallNs / ticks;
+				// Calibrate again on a warm core and keep the cheaper cost: the
+				// corrected figures stay upper bounds either way.
+				Ctx late{ctx.level};
+				calibrate(late);
+				const double startIn = ctx.kIn, startOut = ctx.kOut;
+				ctx.kIn = std::min(ctx.kIn, late.kIn);
+				ctx.kOut = std::min(ctx.kOut, late.kOut);
+				uint32_t clamped = 0;
+				const auto corrected = [&](const Bucket& _b)
+				{
+					const double v = static_cast<double>(_b.self) - static_cast<double>(_b.calls) * ctx.kIn
+						- static_cast<double>(_b.childEnters) * ctx.kOut;
+					if(v < 0.0)
+						++clamped;
+					return std::max(0.0, v);
+				};
+				std::fprintf(stderr, "[probe] level=%u wall=%.2fs ticks/ns=%.3f kIn=%.1f kOut=%.1f ticks (start %.1f/%.1f, end %.1f/%.1f)\n",
+					ctx.level, wallNs * 1e-9, 1.0 / nsPerTick, ctx.kIn, ctx.kOut, startIn, startOut, late.kIn, late.kOut);
+				double sumCorrected = 0.0;
+				for(uint32_t d = 0; d < 2; ++d)
+					for(uint32_t n = 0; n < 2; ++n)
+						for(uint32_t c = 0; c < Calib; ++c)
+							sumCorrected += corrected(ctx.acc[d][n][c]);
+				std::fprintf(stderr, "[probe] corrected ticks cover %.1f%% of wall (rest: probe cost)\n", 100.0 * sumCorrected / ticks);
+				std::fprintf(stderr, "[probe] worker: park wall%%=%.2f (%llu parks) | outside chunks wall%%=%.2f\n",
+					100.0 * corrected(ctx.acc[0][0][Park]) / ticks, static_cast<unsigned long long>(ctx.acc[0][0][Park].calls),
+					100.0 * corrected(ctx.acc[0][0][Outside]) / ticks);
+				static const char* const dspNames[2] = {"mixer", "producer"};
+				for(uint32_t d = 0; d < 2; ++d)
+				{
+					const auto& e = dsps[d]->probeCounters();
+					const auto& s = start[d];
+					const auto diff = [](const uint64_t _a, const uint64_t _b) { return static_cast<unsigned long long>(_a - _b); };
+					for(uint32_t n = 0; n < 2; ++n)
+					{
+						const uint32_t k = n ? 0 : 1;	// skip counters are indexed [nested, own]
+						const double cyc = static_cast<double>(ctx.cycles[d][n]);
+						const double skipped = static_cast<double>(diff(e.nopSkipped[k], s.nopSkipped[k]) + diff(e.pollSkipped[k], s.pollSkipped[k]));
+						const double executed = std::max(1.0, cyc - skipped);
+						double dspSum = 0.0;
+						for(uint32_t c = Exec; c < Calib; ++c)
+							dspSum += corrected(ctx.acc[d][n][c]);
+						std::fprintf(stderr, "[probe] %s %s: cycles=%.0f (%.1f M/s, %.1f%% skipped) wall share=%.1f%% ns/cycle=%.3f ns/executed cycle=%.3f\n",
+							dspNames[d], n ? "nested" : "own", cyc, cyc / wallNs * 1e3, cyc > 0 ? 100.0 * skipped / cyc : 0.0,
+							100.0 * dspSum / ticks, cyc > 0 ? dspSum * nsPerTick / cyc : 0.0, cyc > 0 ? dspSum * nsPerTick / executed : 0.0);
+						for(uint32_t c = Exec; c < Calib; ++c)
+						{
+							const auto& b = ctx.acc[d][n][c];
+							if(!b.calls && !b.self)
+								continue;
+							const double v = corrected(b);
+							std::fprintf(stderr, "[probe]   %-10s calls=%12llu (%8.0f/s) wall%%=%6.2f ns/call=%8.1f ns/cycle=%6.3f\n",
+								catName(c), static_cast<unsigned long long>(b.calls), static_cast<double>(b.calls) / wallNs * 1e9,
+								100.0 * v / ticks, b.calls ? v * nsPerTick / static_cast<double>(b.calls) : 0.0,
+								cyc > 0 ? v * nsPerTick / cyc : 0.0);
+						}
+					}
+					std::fprintf(stderr, "[probe] %s callbacks: periph=%llu intr=%llu prevent=%llu nop=%llu | periphDue=%llu intrEmpty=%llu intrMasked=%llu modeChecks=%llu\n",
+						dspNames[d], diff(e.checks[0], s.checks[0]), diff(e.checks[1], s.checks[1]), diff(e.checks[2], s.checks[2]),
+						diff(e.checks[3], s.checks[3]), diff(e.periphDue, s.periphDue), diff(e.intrEmpty, s.intrEmpty),
+						diff(e.intrMasked, s.intrMasked), diff(e.modeChecks, s.modeChecks));
+					std::fprintf(stderr, "[probe] %s essi slots: tx0=%llu frames=%llu rx0=%llu idle=%llu | tx1=%llu frames=%llu rx1=%llu idle=%llu\n",
+						dspNames[d], diff(e.essiTxSlots[0], s.essiTxSlots[0]), diff(e.essiTxFrames[0], s.essiTxFrames[0]),
+						diff(e.essiRxSlots[0], s.essiRxSlots[0]), diff(e.essiRxIdle[0], s.essiRxIdle[0]),
+						diff(e.essiTxSlots[1], s.essiTxSlots[1]), diff(e.essiTxFrames[1], s.essiTxFrames[1]),
+						diff(e.essiRxSlots[1], s.essiRxSlots[1]), diff(e.essiRxIdle[1], s.essiRxIdle[1]));
+					std::fprintf(stderr, "[probe] %s untimed scope entries (level too low):", dspNames[d]);
+					for(uint32_t c = Exec; c < Calib; ++c)
+						if(ctx.untimedCalls[d][c])
+							std::fprintf(stderr, " %s=%llu", catName(c), static_cast<unsigned long long>(ctx.untimedCalls[d][c]));
+					std::fprintf(stderr, "\n");
+					for(uint32_t n = 0; n < 2; ++n)
+					{
+						const uint32_t k = n ? 0 : 1;	// counters are indexed [nested, own]
+						std::fprintf(stderr, "[probe] %s %s skips: nop calls=%llu skippedCycles=%llu | poll calls=%llu acted=%llu skippedCycles=%llu\n",
+							dspNames[d], n ? "nested" : "own", diff(e.nopCalls[k], s.nopCalls[k]), diff(e.nopSkipped[k], s.nopSkipped[k]),
+							diff(e.pollCalls[k], s.pollCalls[k]), diff(e.pollActed[k], s.pollActed[k]), diff(e.pollSkipped[k], s.pollSkipped[k]));
+						uint64_t reads = 0;
+						for(uint32_t r = 0; r < 128; ++r)
+							reads += ctx.mmioReads[d][n][r];
+						std::fprintf(stderr, "[probe] %s %s mmio reads=%llu (%.0f/s):", dspNames[d], n ? "nested" : "own",
+							static_cast<unsigned long long>(reads), static_cast<double>(reads) / wallNs * 1e9);
+						for(uint32_t r = 0; r < 128; ++r)
+						{
+							if(ctx.mmioReads[d][n][r] && ctx.mmioReads[d][n][r] * 100 >= reads)
+								std::fprintf(stderr, " $ffff%02x=%llu", 0x80 + r, static_cast<unsigned long long>(ctx.mmioReads[d][n][r]));
+						}
+						std::fprintf(stderr, "\n");
+					}
+				}
+				std::fprintf(stderr, "[probe] buckets clamped by the correction: %u\n", clamped);
+			}
+		};
+	}
+#endif
 
 	void Hardware::pairWorkerLoop()
 	{
@@ -2384,6 +2563,9 @@ namespace md
 		dsp56k::ThreadTools::setCurrentThreadName("MD DSPs");
 		if(m_pairWorkerAffinity)
 			dsp56k::ThreadTools::setCurrentThreadAffinity(m_pairWorkerAffinity);
+#ifdef DSP56K_TSC_PROBES
+		PairProbeSession probeSession(m_dspMixer.dsp(), m_dspProducer.dsp());
+#endif
 		const bool trace = m_transportTrace;
 		std::array<uint64_t, 2> gate{};
 		const auto runnable = [&](const uint32_t _i)
@@ -2440,10 +2622,13 @@ namespace md
 					return ((_i == 0) ? m_dspMixer : m_dspProducer).dsp().getCycles() + minChunk
 						<= pairGateCycles(_i, false);
 				};
-				m_signal.waitFor(std::chrono::microseconds(500), [&]
 				{
-					return m_workerExit.load(std::memory_order_acquire) || wouldRun(0) || wouldRun(1);
-				});
+					DSP_PROBE_SCOPE(0, Park, 0);
+					m_signal.waitFor(std::chrono::microseconds(500), [&]
+					{
+						return m_workerExit.load(std::memory_order_acquire) || wouldRun(0) || wouldRun(1);
+					});
+				}
 				if(trace)
 				{
 					m_timeTrace.workerParks.fetch_add(1, std::memory_order_relaxed);
@@ -2535,10 +2720,10 @@ namespace md
 
 	void Hardware::enableParallelTransport()
 	{
-		if(const char* const mode = std::getenv("MDMM_TRANSPORT"))
-			m_transportMode = parseTransportMode(mode);
-		if(const char* const help = std::getenv("MDMM_PRODUCER_HELP_US"))
-			m_producerHelpDelayUs = static_cast<uint32_t>(std::strtoul(help, nullptr, 10));
+		if(const auto mode = parseTransportMode(std::getenv("MDMM_TRANSPORT")))
+			m_transportMode = *mode;
+		if(const auto help = envCount<uint32_t>("MDMM_PRODUCER_HELP_US"))
+			m_producerHelpDelayUs = *help;
 	}
 
 	uint64_t Hardware::producerGateHint() const
@@ -2613,7 +2798,7 @@ namespace md
 			proAudio.task = dsp56k::ThreadTools::joinProAudioTask();
 		dsp56k::ThreadTools::setCurrentThreadName("MD DSP2");
 		auto& d = m_dspProducer;
-		const bool trace = std::getenv("MDMM_TRANSPORT_TRACE") != nullptr;
+		const bool trace = envOverride("MDMM_TRANSPORT_TRACE") != nullptr;
 		uint64_t chunks = 0, parks = 0;
 		// The audio thread may be executing the producer (tryHelpProducer):
 		// outside m_producerExec only published values are readable, so the
@@ -2988,16 +3173,24 @@ namespace md
 
 	bool Hardware::linkRxAvailable(const uint32_t _consumer)
 	{
+		auto& tick = m_linkRxTick[_consumer].value;
+		tick.cycles = ~0ull;
 		if(linkDisposeAtConsumer(_consumer, true))
 			return false;
-		if(linkHeadDue(_consumer))
+		const double now = linkConsumerNow(_consumer);
+		// With one thread running both DSPs, nothing reaches this ring or the
+		// consumer's receiver before the pop of this slot: leave it the
+		// disposal just done and this position (blockingPop).
+		if(dspsShareThread())
+			tick = {((_consumer == 0) ? m_dspMixer : m_dspProducer).dsp().getCycles(), now};
+		if(linkHeadDue(_consumer, now))
 			return true;
 		// Mixer input with a threaded producer: an empty (or immature) ring
 		// is genuinely empty only if the producer has already passed the
 		// time this slot needs (pop rule (c)); otherwise wait for it (d).
 		if(_consumer != 0 || dspsShareThread() || !m_schedDspOriginLatched[1])
 			return false;
-		const double needed = linkConsumerNow(0) - m_linkPipelineDepthFrames;
+		const double needed = now - m_linkPipelineDepthFrames;
 		// Never wait for more than the producer's own UC gate can grant (the
 		// exact rational conversion it uses): the UC runs on this thread and
 		// cannot advance while the mixer waits here, so a need past it could
@@ -3129,7 +3322,8 @@ namespace md
 				++score.unexpectedShort;);
 	}
 
-	void Hardware::schedCatchUpDspToDsp(const uint32_t _consumer, const uint32_t _producer)
+	void Hardware::schedCatchUpDspToDsp(const uint32_t _consumer, const uint32_t _producer,
+		const std::optional<double> _producerPos)
 	{
 		// Before a producer DSP enqueues a link frame into the ESSI route,
 		// consumer DSP's input ring, advance the CONSUMER to the producer's current machine time - so a
@@ -3155,7 +3349,7 @@ namespace md
 			return;
 		}
 		auto& d = (c == 0) ? m_dspMixer : m_dspProducer;
-		const double producerPos = schedDspFramePos(p);
+		const double producerPos = _producerPos ? *_producerPos : schedDspFramePos(p);
 		const double deltaFrames = producerPos - m_schedDspOriginFrame[c];
 		if(deltaFrames <= 0.0)
 		{
@@ -3179,6 +3373,9 @@ namespace md
 			score.requestedCycles += requested;
 			score.maximumRequestedCycles = std::max(score.maximumRequestedCycles, requested););
 		m_schedInLinkDelivery = true;
+#ifdef DSP56K_TSC_PROBES
+		const auto probeToken = dsp56k::probe::enter(0, dsp56k::probe::CatchUp, c);
+#endif
 		const bool bpGate = isMonomachine();
 		// A consumer on the pair worker gets its UC items through the dated
 		// stream: land them on the way at their deadlines, as its own chunks do.
@@ -3204,6 +3401,18 @@ namespace md
 		}
 		else
 		{
+			// Between two blocks this loop acts only at targetCyc, clampStop and
+			// nextHostItem, and on the host backlog. The consumer grows the
+			// backlog only by writing HOTX; in pair mode the UC thread moves it
+			// too, but at no particular DSP cycle, so checking it at every block
+			// never pinned that down either. So run up to the nearest of the
+			// three under one trampoline entry, which a HOTX write leaves once
+			// its block completes (Dsp::setExecExitOnHostTx): the backlog is
+			// checked where a block-by-block loop checked it. NOP and polling
+			// loops skip up to that target, as in the consumer's own chunks;
+			// stepped with exec(), every polling iteration of a catch-up ran as
+			// a block of its own.
+			d.setExecExitOnHostTx(true);
 			while(d.dsp().getCycles() < targetCyc && d.dsp().getCycles() < clampStop
 				&& d.hostTxBacklog() <= policy.hostTransmitBackpressureThresholdWords)
 			{
@@ -3216,9 +3425,13 @@ namespace md
 					if(nextHostItem <= d.dsp().getCycles())
 						nextHostItem = std::numeric_limits<uint64_t>::max();
 				}
-				d.dsp().exec();
+				d.dsp().execUntilCycles(std::min(std::min(targetCyc, clampStop), nextHostItem));
 			}
+			d.setExecExitOnHostTx(false);
 		}
+#ifdef DSP56K_TSC_PROBES
+		dsp56k::probe::leave(probeToken);
+#endif
 		m_schedInLinkDelivery = false;
 		MD_TRANSPORT_RECORD(const auto executed = d.dsp().getCycles() - startCyc;
 			score.executedCycles += executed;
