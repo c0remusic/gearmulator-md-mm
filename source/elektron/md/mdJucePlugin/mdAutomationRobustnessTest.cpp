@@ -11,6 +11,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <exception>
+#include <functional>
 #include <iostream>
 #include <map>
 #include <new>
@@ -1236,6 +1237,233 @@ namespace
 		return true;
 	}
 
+	// The controller keeps a machine per track from applied Kit dumps and its own
+	// assignments. An assignment sends nothing else: the values the firmware set
+	// (mdEditorFirmwareTest) become unknown until an applied Kit dump, a value the
+	// firmware sends, or a host or editor write.
+	void verifyMachineAssignment(Harness& _harness)
+	{
+		auto& controller = _harness.controller;
+		const bool mm = _harness.model == md::MachineModel::Monomachine;
+		const uint8_t tracks = mm ? 6 : 16;
+		const uint16_t first = mm ? 3 : 16;      // SID-6581, TRX-BD
+		const uint16_t second = mm ? 32 : 176;   // DPRO-DDRW, ROM-33
+		const auto loadKit = [&]
+		{
+			controller.onStateLoaded();
+			controller.parseSysexMessage(statusResponse(_harness.model,
+				md::automation::sysex::StatusParameter::Global, 0), synthLib::MidiEventSource::Device);
+			controller.parseSysexMessage(statusResponse(_harness.model,
+				md::automation::sysex::StatusParameter::Kit, 0), synthLib::MidiEventSource::Device);
+			controller.parseSysexMessage(makeGlobalDump(_harness.model, 0, 0), synthLib::MidiEventSource::Device);
+			controller.parseSysexMessage(makeKitDump(_harness.model, 0, 23, std::vector<uint16_t>(tracks, first)),
+				synthLib::MidiEventSource::Device);
+		};
+		// The unknown values of a track, by page
+		const auto unknown = [&](const uint8_t _track)
+		{
+			std::map<uint8_t, size_t> pages;
+			for(auto* const parameter : parameters(_harness, true))
+			{
+				const auto& description = parameter->getDescription();
+				if(parameter->getPart() == _track && !controller.isValueKnown(description.page, _track, description.index))
+					++pages[description.page];
+			}
+			return pages;
+		};
+		const auto find = [&](const uint8_t _track, const uint8_t _page) -> pluginLib::Parameter&
+		{
+			for(auto* const parameter : parameters(_harness, true))
+				if(parameter->getPart() == _track && parameter->getDescription().page == _page)
+					return *parameter;
+			throw std::runtime_error("no parameter on that page");
+		};
+
+		loadKit();
+		require(controller.isAutomationSynchronized(), "machine test did not synchronize");
+		for(uint8_t track = 0; track < tracks; ++track)
+			require(controller.getTrackMachine(track) == first, "applied Kit dump did not set the track machines");
+		require(unknown(2).empty(), "values unknown after an applied Kit dump");
+		require(snapshotIsComplete(controller.createAutomationSnapshot()), "synchronized snapshot not complete");
+
+		const auto revision = controller.getMachineRevision();
+		const auto valueRevision = controller.getValueStateRevision();
+		const auto sent = controller.getTransmittedAutomationChangeCount();
+		require(controller.assignMachine(2, second), "valid machine assignment refused");
+		require(controller.getTrackMachine(2) == second && controller.getTrackMachine(1) == first,
+			"assignment changed the wrong track");
+		require(controller.getMachineRevision() > revision, "assignment did not bump the machine revision");
+		require(controller.getTransmittedAutomationChangeCount() == sent,
+			"assignment wrote cached values over the ones the firmware set");
+		// MD: synthesis, effects and routing pages (24), not the level; MM: synthesis (8).
+		const auto pages = unknown(2);
+		const auto expected = mm ? std::map<uint8_t, size_t>{{md::automation::monomachine::Synthesis, 8}}
+			: std::map<uint8_t, size_t>{{md::automation::machinedrum::Synthesis, 8},
+				{md::automation::machinedrum::Effects, 8}, {md::automation::machinedrum::Routing, 8}};
+		require(pages == expected, "assignment did not make exactly the machine's values unknown");
+		require(unknown(1).empty(), "assignment made another track's values unknown");
+		require(controller.getValueStateRevision() > valueRevision, "assignment did not bump the value state revision");
+		// Restoring cached values would overwrite what the firmware holds
+		require(!snapshotIsComplete(controller.createAutomationSnapshot()),
+			"snapshot with unknown values claims a complete baseline");
+
+		const auto refused = controller.getTransmittedAutomationChangeCount();
+		require(!controller.assignMachine(tracks, first), "assignment accepted a track the model does not have");
+		require(!controller.assignMachine(0, 6000), "assignment accepted an unknown machine");
+		require(controller.getTransmittedAutomationChangeCount() == refused, "refused assignment transmitted values");
+		require(unknown(0).empty(), "refused assignment made values unknown");
+
+		// A host write sets the value: it is known again, the others stay unknown.
+		auto& written = find(2, md::automation::machinedrum::Synthesis);
+		const auto writeRevision = controller.getValueStateRevision();
+		hostWrite(written, 77);
+		controller.processRealtimeParameterChanges(64);
+		require(controller.isValueKnown(written.getDescription().page, 2, written.getDescription().index),
+			"host write did not make the value known");
+		require(controller.getValueStateRevision() > writeRevision, "host write did not bump the value state revision");
+		require(unknown(2).at(md::automation::machinedrum::Synthesis) == 7, "host write made other values known");
+
+		// A same-slot inspection dump holds the stored Kit, not the live one: it
+		// must not undo the assignment nor claim to know the firmware's values. A
+		// state load applies its Kit and does both.
+		primeSyntheticSnapshot(_harness);
+		require(controller.getTrackMachine(2) == second, "inspection dump undid a live machine assignment");
+		require(!unknown(2).empty(), "inspection dump of the stored Kit made the live values known");
+		loadKit();
+		require(controller.getTrackMachine(2) == first, "state load kept a machine its Kit does not hold");
+		require(unknown(2).empty(), "applied Kit dump left values unknown");
+		require(snapshotIsComplete(controller.createAutomationSnapshot()), "snapshot incomplete after the Kit reload");
+	}
+
+	// requestPattern asks for the current pattern number, then that pattern's dump;
+	// other dumps are ignored, and the 5 s status poll notices another pattern.
+	void verifyPatternReading(Harness& _harness)
+	{
+		auto& controller = _harness.controller;
+		using Status = md::automation::sysex::StatusParameter;
+		if(_harness.model == md::MachineModel::Monomachine)
+		{
+			// The same on the Monomachine, its pattern from getMmPattern: a dump with one trig playing _note
+			const auto mmDump = [](const uint8_t _slot, const uint8_t _length, const uint8_t _note)
+			{
+				auto editor = md::automation::sysex::MmPatternEditor::fromDump(makeMmPatternDump(_slot, _length));
+				require(editor && editor->setTrig(0, 0, _note), "MM test pattern not built");
+				const auto dump = editor->toDump();
+				return pluginLib::SysEx(dump.begin(), dump.end());
+			};
+			require(controller.getPatternRevision() == 0 && !controller.getMmPattern(), "pattern known before any read");
+			require(controller.requestPattern(), "pattern read refused on a ready controller");
+			controller.parseSysexMessage(statusResponse(_harness.model, Status::Pattern, 18), synthLib::MidiEventSource::Device);
+			controller.parseSysexMessage(mmDump(5, 16, 48), synthLib::MidiEventSource::Device);
+			require(controller.getPatternRevision() == 0, "dump of a pattern that was not asked for was stored");
+			controller.parseSysexMessage(mmDump(18, 24, 60), synthLib::MidiEventSource::Device);
+			const auto pattern = controller.getMmPattern();
+			require(controller.getPatternRevision() == 1 && pattern && pattern->slot == 18 && pattern->length == 24
+				&& pattern->note(0, 0) == uint8_t{60} && !controller.getPattern(), "requested pattern dump was not stored");
+			controller.parseSysexMessage(mmDump(18, 16, 48), synthLib::MidiEventSource::Device);
+			require(controller.getPatternRevision() == 1, "unsolicited pattern dump replaced the stored one");
+			controller.parseSysexMessage(statusResponse(_harness.model, Status::Pattern, 18), synthLib::MidiEventSource::Device);
+			controller.parseSysexMessage(mmDump(18, 16, 48), synthLib::MidiEventSource::Device);
+			require(controller.getPatternRevision() == 1, "status for the shown pattern led to a new read");
+			controller.parseSysexMessage(statusResponse(_harness.model, Status::Pattern, 20), synthLib::MidiEventSource::Device);
+			controller.parseSysexMessage(mmDump(20, 16, 48), synthLib::MidiEventSource::Device);
+			require(controller.getPatternRevision() == 2 && controller.getMmPattern()->slot == 20,
+				"another current pattern was not read");
+			return;
+		}
+		std::array<uint32_t, 16> trigs{};
+		trigs[0] = 0x11;
+		require(controller.getPatternRevision() == 0 && !controller.getPattern(), "pattern known before any read");
+		require(controller.requestPattern(), "pattern read refused on a ready controller");
+		controller.parseSysexMessage(statusResponse(_harness.model, Status::Pattern, 18), synthLib::MidiEventSource::Device);
+		controller.parseSysexMessage(makeMdPatternDump(5, 16, trigs), synthLib::MidiEventSource::Device);
+		require(controller.getPatternRevision() == 0, "dump of a pattern that was not asked for was stored");
+		controller.parseSysexMessage(makeMdPatternDump(18, 24, trigs, 99), synthLib::MidiEventSource::Device);
+		const auto pattern = controller.getPattern();
+		require(controller.getPatternRevision() == 1 && pattern && pattern->slot == 18 && pattern->length == 24
+			&& pattern->hasTrig(0, 0) && pattern->hasTrig(0, 4) && pattern->lock(0, 0, 0) == uint8_t{99},
+			"requested pattern dump was not stored");
+
+		controller.parseSysexMessage(makeMdPatternDump(18, 16, trigs), synthLib::MidiEventSource::Device);
+		require(controller.getPatternRevision() == 1, "unsolicited pattern dump replaced the stored one");
+
+		// Periodic poll: the same pattern does not lead to a dump, another one does.
+		controller.parseSysexMessage(statusResponse(_harness.model, Status::Pattern, 18), synthLib::MidiEventSource::Device);
+		controller.parseSysexMessage(makeMdPatternDump(18, 16, trigs), synthLib::MidiEventSource::Device);
+		require(controller.getPatternRevision() == 1, "status for the shown pattern led to a new read");
+		controller.parseSysexMessage(statusResponse(_harness.model, Status::Pattern, 20), synthLib::MidiEventSource::Device);
+		controller.parseSysexMessage(makeMdPatternDump(20, 16, trigs), synthLib::MidiEventSource::Device);
+		require(controller.getPatternRevision() == 2 && controller.getPattern()->slot == 20,
+			"another current pattern was not read");
+	}
+
+	// Runs after verifyPatternReading, with pattern 20 (16 steps, trigs on steps 1 and 5 of track 1) shown.
+	void verifyPatternWriting(Harness& _harness)
+	{
+		auto& controller = _harness.controller;
+		using Write = mdJucePlugin::Controller::PatternWrite;
+		using Status = md::automation::sysex::StatusParameter;
+		if(_harness.model == md::MachineModel::Monomachine)
+		{
+			require(!controller.setPatternTrig(0, 0, true) && !controller.sendPattern(), "Monomachine accepted a pattern edit");
+			return;
+		}
+		std::array<uint32_t, 16> trigs{};
+		trigs[0] = 0x11;
+		const auto shown = makeMdPatternDump(20, 16, trigs);
+		const auto firmwareDump = [&](const std::function<void(md::automation::sysex::MdPatternEditor&)>& _edits)
+		{
+			auto editor = md::automation::sysex::MdPatternEditor::fromDump(shown);
+			require(editor.has_value(), "test pattern not editable");
+			_edits(*editor);
+			const auto dump = editor->toDump();
+			return pluginLib::SysEx(dump.begin(), dump.end());
+		};
+		const auto reply = [&](const pluginLib::SysEx& _dump)
+		{
+			controller.parseSysexMessage(_dump, synthLib::MidiEventSource::Device);
+		};
+
+		// Edits show at once and are sent together.
+		require(!controller.sendPattern(), "an unedited pattern was sent");
+		const auto revision = controller.getPatternRevision();
+		require(controller.setPatternTrig(0, 1, true) && controller.setPatternLock(0, 3, 1, 55), "pattern edit refused");
+		require(!controller.setPatternLock(0, 3, 2, 1), "lock accepted on a step without a trig");
+		require(controller.getPatternRevision() == revision + 2 && controller.getPattern()->hasTrig(0, 1)
+			&& controller.getPattern()->lock(0, 3, 1) == uint8_t{55}, "edit not shown");
+		require(controller.getPatternWrite() == Write::None, "write state before any write");
+		require(controller.sendPattern() && controller.getPatternWrite() == Write::Pending, "edited pattern not sent");
+		require(!controller.sendPattern(), "the same edits were sent twice");
+		const auto kept = firmwareDump([](auto& _e) { _e.setTrig(0, 1, true); _e.setLock(0, 3, 1, 55); });
+		reply(kept);
+		require(controller.getPatternWrite() == Write::Written && controller.getPattern()->lock(0, 3, 1) == uint8_t{55},
+			"read-back as sent not reported as written");
+
+		// A read-back that differs is reported, and the firmware's pattern is shown.
+		require(controller.setPatternLock(0, 3, 1, 60) && controller.sendPattern(), "second edit not sent");
+		reply(kept);
+		require(controller.getPatternWrite() == Write::Refused && controller.getPattern()->lock(0, 3, 1) == uint8_t{55},
+			"read-back without the edit not reported as refused");
+
+		// Two writes in flight: only the second read-back decides.
+		require(controller.setPatternLock(0, 3, 1, 61) && controller.sendPattern(), "first of two writes not sent");
+		require(controller.setPatternLock(0, 3, 1, 62) && controller.sendPattern(), "second of two writes not sent");
+		reply(firmwareDump([](auto& _e) { _e.setTrig(0, 1, true); _e.setLock(0, 3, 1, 61); }));
+		require(controller.getPatternWrite() == Write::Pending && controller.getPattern()->lock(0, 3, 1) == uint8_t{62},
+			"the first read-back replaced a newer edit");
+		reply(firmwareDump([](auto& _e) { _e.setTrig(0, 1, true); _e.setLock(0, 3, 1, 62); }));
+		require(controller.getPatternWrite() == Write::Written, "the last read-back did not decide");
+
+		// An edit not sent yet stays over a read of the same pattern.
+		require(controller.setPatternLock(0, 3, 1, 70), "unsent edit refused");
+		require(controller.requestPattern(), "pattern read refused");
+		controller.parseSysexMessage(statusResponse(_harness.model, Status::Pattern, 20), synthLib::MidiEventSource::Device);
+		reply(kept);
+		require(controller.getPattern()->lock(0, 3, 1) == uint8_t{70}, "a read of the same pattern dropped an unsent edit");
+		require(controller.sendPattern(), "unsent edit could not be sent after a read");
+		reply(firmwareDump([](auto& _e) { _e.setTrig(0, 1, true); _e.setLock(0, 3, 1, 70); }));
+	}
+
 	void verifyArchitecture(const md::MachineModel _model)
 	{
 		verifyRetriedKitSynchronization(_model, false);
@@ -1250,6 +1478,9 @@ namespace
 		primeSyntheticSnapshot(harness);
 		verifyStateLoadReplacesSameSlotBaseline(harness);
 		verifyMuteOwnership(harness);
+		verifyMachineAssignment(harness);
+		verifyPatternReading(harness);
+		verifyPatternWriting(harness);
 		verifyOrderedIntentArchitecture(harness);
 		verifyAdversarialRestoreSynchronization(harness);
 		verifyConcurrentPublicationArchitecture(harness);
